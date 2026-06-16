@@ -593,6 +593,29 @@ fn alignment_span_from_ops(raw_operations: &[u8]) -> ((usize, usize), (usize, us
     )
 }
 
+fn extension_alignment_span_from_ops(raw_operations: &[u8]) -> ((usize, usize), (usize, usize)) {
+    let mut pattern_end = 0;
+    let mut text_end = 0;
+
+    for &op in raw_operations {
+        match op {
+            b'I' => {
+                text_end += 1;
+            }
+            b'D' => {
+                pattern_end += 1;
+            }
+            b'M' | b'X' => {
+                pattern_end += 1;
+                text_end += 1;
+            }
+            _ => panic!("unexpected WFA operation: {}", op as char),
+        }
+    }
+
+    ((0, pattern_end), (0, text_end))
+}
+
 struct WfaRawHandle {
     attributes: WFAttributes,
     inner: *mut wfa2::wavefront_aligner_t,
@@ -610,6 +633,19 @@ impl WfaRawHandle {
 
     fn distance_metric(&self) -> DistanceMetric {
         DistanceMetric::from(self.attributes.inner.distance_metric)
+    }
+
+    fn memory_model(&self) -> MemoryModel {
+        match self.attributes.inner.memory_mode {
+            wfa2::wavefront_memory_t_wavefront_memory_high => MemoryModel::MemoryHigh,
+            wfa2::wavefront_memory_t_wavefront_memory_med => MemoryModel::MemoryMed,
+            wfa2::wavefront_memory_t_wavefront_memory_low => MemoryModel::MemoryLow,
+            wfa2::wavefront_memory_t_wavefront_memory_ultralow => MemoryModel::MemoryUltraLow,
+            _ => panic!(
+                "Unknown memory model: {}",
+                self.attributes.inner.memory_mode
+            ),
+        }
     }
 
     fn penalties(&self) -> Penalties {
@@ -696,6 +732,12 @@ impl WfaRawHandle {
         }
     }
 
+    fn set_alignment_extension(&mut self) {
+        unsafe {
+            wfa2::wavefront_aligner_set_alignment_extension(self.inner);
+        }
+    }
+
     fn align_end_to_end(&mut self, pattern: &[u8], text: &[u8]) -> i32 {
         self.set_alignment_end_to_end();
         self.align(pattern, text)
@@ -716,6 +758,15 @@ impl WfaRawHandle {
             text_begin_free,
             text_end_free,
         );
+        self.align(pattern, text)
+    }
+
+    fn align_extension(&mut self, pattern: &[u8], text: &[u8]) -> i32 {
+        if self.memory_model() == MemoryModel::MemoryUltraLow {
+            panic!("Extension alignment is not supported with MemoryUltraLow");
+        }
+
+        self.set_alignment_extension();
         self.align(pattern, text)
     }
 
@@ -870,6 +921,13 @@ impl WfaRawHandle {
             panic!("Internal aligner pointer is null");
         }
         unsafe { (*self.inner).alignment_form.span == wfa2::alignment_span_t_alignment_end2end }
+    }
+
+    fn is_extension_alignment(&self) -> bool {
+        if self.inner.is_null() {
+            panic!("Internal aligner pointer is null");
+        }
+        unsafe { (*self.inner).alignment_form.extension }
     }
 
     fn sam_cigar(&self, show_mismatches: bool) -> Vec<u32> {
@@ -1104,6 +1162,17 @@ impl WFAligner {
         AlignmentStatus::from(status)
     }
 
+    /// Align a right extension using WFA2's extension mode.
+    ///
+    /// With `AlignmentScope::Alignment`, WFA2 trims the active CIGAR to the
+    /// maximal-scoring extension and can return `StatusAlgPartial`.
+    /// `MemoryUltraLow` is rejected because WFA2's BiWFA path exits the process
+    /// for extension alignments.
+    pub fn align_extension(&mut self, pattern: &[u8], text: &[u8]) -> AlignmentStatus {
+        let status = self.raw.align_extension(pattern, text);
+        AlignmentStatus::from(status)
+    }
+
     pub fn score(&self) -> i32 {
         self.raw.score()
     }
@@ -1152,9 +1221,12 @@ impl WFAligner {
 
         // Check if alignment was end-to-end
         let is_global = self.raw.is_global_alignment();
+        let is_extension = self.raw.is_extension_alignment();
         // For global alignment, span is always the full sequence lengths
         let ((xstart, xend), (ystart, yend)) = if is_global {
             ((0, pattern_len), (0, text_len))
+        } else if is_extension {
+            extension_alignment_span_from_ops(raw_operations)
         } else {
             alignment_span_from_ops(raw_operations)
         };
@@ -1175,10 +1247,14 @@ impl WFAligner {
     pub fn get_alignment_span(&self) -> ((usize, usize), (usize, usize)) {
         // Check if alignment was end-to-end
         let is_global = self.raw.is_global_alignment();
+        let is_extension = self.raw.is_extension_alignment();
 
         if is_global {
             let (pattern_len, text_len) = self.raw.sequence_lengths();
             ((0, pattern_len), (0, text_len))
+        } else if is_extension {
+            let cigar = self.raw.cigar_view().unwrap();
+            extension_alignment_span_from_ops(cigar.active_operation_bytes())
         } else {
             let cigar = self.raw.cigar_view().unwrap();
             alignment_span_from_ops(cigar.active_operation_bytes())
@@ -1664,6 +1740,73 @@ mod tests {
             format!("{}\n{}\n{}", a, b, c),
             "AATTTAAGTCTG-CTACTTTCACGCAGCT---------------\n||||| |||||| |||||||||||    |               \nAATTTCAGTCTGGCTACTTTCACG----TACGATGACAGACTCT"
         );
+    }
+
+    #[test]
+    fn test_aligner_extension_trims_to_maximal_scoring_prefix() {
+        let pattern = b"AATTTAAGTCTGCTACTTTCACGCAGCT";
+        let text = b"AATTTCAGTCTGGCTACTTTCACGTACGATGACAGACTCT";
+
+        let mut ends_free_aligner =
+            WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
+                .affine(6, 4, 2)
+                .build();
+        let ends_free_status = ends_free_aligner.align_ends_free(
+            pattern,
+            0,
+            pattern.len() as i32,
+            text,
+            0,
+            text.len() as i32,
+        );
+        assert_eq!(ends_free_status, AlignmentStatus::StatusAlgCompleted);
+        assert_eq!(ends_free_aligner.score(), -24);
+        assert_eq!(ends_free_aligner.cigar_string(None), "5M1X6M1I11M4D1M15I");
+
+        let mut extension_aligner =
+            WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
+                .affine(6, 4, 2)
+                .build();
+        let extension_status = extension_aligner.align_extension(pattern, text);
+        assert_eq!(extension_status, AlignmentStatus::StatusAlgPartial);
+        assert_eq!(extension_aligner.score(), 10);
+        assert_eq!(extension_aligner.cigar_string(None), "5M1X6M1I11M");
+        assert_eq!(extension_aligner.cigar_score(), -12);
+
+        let alignment = extension_aligner.get_alignment();
+        assert_eq!(alignment.score, 10);
+        assert_eq!(alignment.xstart, 0);
+        assert_eq!(alignment.xend, 23);
+        assert_eq!(alignment.ystart, 0);
+        assert_eq!(alignment.yend, 24);
+
+        let ((xstart, xend), (ystart, yend)) = extension_aligner.get_alignment_span();
+        assert_eq!((xstart, xend), (0, 23));
+        assert_eq!((ystart, yend), (0, 24));
+    }
+
+    #[test]
+    fn test_aligner_extension_supports_score_scope() {
+        let pattern = b"AATTTAAGTCTGCTACTTTCACGCAGCT";
+        let text = b"AATTTCAGTCTGGCTACTTTCACGTACGATGACAGACTCT";
+        let mut aligner = WFAligner::builder(AlignmentScope::Score, MemoryModel::MemoryHigh)
+            .affine(6, 4, 2)
+            .build();
+
+        let status = aligner.align_extension(pattern, text);
+        assert_eq!(status, AlignmentStatus::StatusAlgCompleted);
+        assert_eq!(aligner.score(), -24);
+    }
+
+    #[test]
+    #[should_panic(expected = "Extension alignment is not supported with MemoryUltraLow")]
+    fn test_aligner_extension_rejects_ultralow_memory() {
+        let mut aligner =
+            WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryUltraLow)
+                .affine(6, 4, 2)
+                .build();
+
+        aligner.align_extension(b"ACGT", b"ACGT");
     }
 
     #[test]
