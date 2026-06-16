@@ -66,14 +66,159 @@ impl From<u32> for AlignmentScope {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Heuristic {
-    None,
-    WFadaptive(i32, i32, i32),
-    WFmash(i32, i32, i32),
-    XDrop(i32, i32),
-    ZDrop(i32, i32),
-    BandedStatic(i32, i32),
-    BandedAdaptive(i32, i32, i32),
+pub enum AdaptiveHeuristic {
+    WfAdaptive {
+        min_wavefront_length: i32,
+        max_distance_threshold: i32,
+    },
+    WfMash {
+        min_wavefront_length: i32,
+        max_distance_threshold: i32,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DropHeuristic {
+    XDrop { xdrop: i32 },
+    ZDrop { zdrop: i32 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BandHeuristic {
+    Static { min_k: i32, max_k: i32 },
+    Adaptive { min_k: i32, max_k: i32 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Heuristics {
+    steps_between_cutoffs: i32,
+    adaptive: Option<AdaptiveHeuristic>,
+    drop_heuristic: Option<DropHeuristic>,
+    band: Option<BandHeuristic>,
+}
+
+impl Default for Heuristics {
+    fn default() -> Self {
+        Self::none()
+    }
+}
+
+impl Heuristics {
+    pub fn none() -> Self {
+        Self {
+            steps_between_cutoffs: 1,
+            adaptive: None,
+            drop_heuristic: None,
+            band: None,
+        }
+    }
+
+    pub fn new(steps_between_cutoffs: i32) -> Self {
+        validate_heuristic_steps(steps_between_cutoffs);
+        Self {
+            steps_between_cutoffs,
+            ..Self::none()
+        }
+    }
+
+    pub fn wfa2_default() -> Self {
+        Self::wf_adaptive(1, 10, 50)
+    }
+
+    pub fn wf_adaptive(
+        steps_between_cutoffs: i32,
+        min_wavefront_length: i32,
+        max_distance_threshold: i32,
+    ) -> Self {
+        Self::new(steps_between_cutoffs).with_adaptive(AdaptiveHeuristic::WfAdaptive {
+            min_wavefront_length,
+            max_distance_threshold,
+        })
+    }
+
+    pub fn wf_mash(
+        steps_between_cutoffs: i32,
+        min_wavefront_length: i32,
+        max_distance_threshold: i32,
+    ) -> Self {
+        Self::new(steps_between_cutoffs).with_adaptive(AdaptiveHeuristic::WfMash {
+            min_wavefront_length,
+            max_distance_threshold,
+        })
+    }
+
+    pub fn xdrop(steps_between_cutoffs: i32, xdrop: i32) -> Self {
+        Self::new(steps_between_cutoffs).with_drop(DropHeuristic::XDrop { xdrop })
+    }
+
+    pub fn zdrop(steps_between_cutoffs: i32, zdrop: i32) -> Self {
+        Self::new(steps_between_cutoffs).with_drop(DropHeuristic::ZDrop { zdrop })
+    }
+
+    pub fn banded_static(min_k: i32, max_k: i32) -> Self {
+        Self::none().with_band(BandHeuristic::Static { min_k, max_k })
+    }
+
+    pub fn banded_adaptive(steps_between_cutoffs: i32, min_k: i32, max_k: i32) -> Self {
+        Self::new(steps_between_cutoffs).with_band(BandHeuristic::Adaptive { min_k, max_k })
+    }
+
+    pub fn with_steps_between_cutoffs(mut self, steps_between_cutoffs: i32) -> Self {
+        validate_heuristic_steps(steps_between_cutoffs);
+        self.steps_between_cutoffs = steps_between_cutoffs;
+        self
+    }
+
+    pub fn with_adaptive(mut self, adaptive: AdaptiveHeuristic) -> Self {
+        validate_adaptive_heuristic(adaptive);
+        self.adaptive = Some(adaptive);
+        self
+    }
+
+    pub fn with_drop(mut self, drop_heuristic: DropHeuristic) -> Self {
+        validate_drop_heuristic(drop_heuristic);
+        self.drop_heuristic = Some(drop_heuristic);
+        self
+    }
+
+    pub fn with_band(mut self, band: BandHeuristic) -> Self {
+        validate_band_heuristic(band);
+        self.band = Some(band);
+        self
+    }
+
+    pub fn steps_between_cutoffs(&self) -> i32 {
+        self.steps_between_cutoffs
+    }
+
+    pub fn adaptive(&self) -> Option<AdaptiveHeuristic> {
+        self.adaptive
+    }
+
+    pub fn drop_heuristic(&self) -> Option<DropHeuristic> {
+        self.drop_heuristic
+    }
+
+    pub fn band(&self) -> Option<BandHeuristic> {
+        self.band
+    }
+
+    pub fn is_none(&self) -> bool {
+        self.adaptive.is_none() && self.drop_heuristic.is_none() && self.band.is_none()
+    }
+
+    fn validate(&self) {
+        validate_heuristic_steps(self.steps_between_cutoffs);
+        if let Some(adaptive) = self.adaptive {
+            validate_adaptive_heuristic(adaptive);
+        }
+        if let Some(drop_heuristic) = self.drop_heuristic {
+            validate_drop_heuristic(drop_heuristic);
+        }
+        if let Some(band) = self.band {
+            validate_band_heuristic(band);
+        }
+    }
 }
 
 /// Resource controls for bounding WFA2 alignment work.
@@ -137,6 +282,7 @@ impl ResourceLimits {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DistanceMetric {
     Indel,
     Edit,
@@ -244,6 +390,68 @@ fn validate_min_offsets_per_thread(min_offsets_per_thread: i32) {
     );
 }
 
+fn validate_heuristic_steps(steps_between_cutoffs: i32) {
+    assert!(
+        steps_between_cutoffs > 0,
+        "steps_between_cutoffs must be positive"
+    );
+}
+
+fn validate_adaptive_heuristic(adaptive: AdaptiveHeuristic) {
+    let (min_wavefront_length, max_distance_threshold) = match adaptive {
+        AdaptiveHeuristic::WfAdaptive {
+            min_wavefront_length,
+            max_distance_threshold,
+        }
+        | AdaptiveHeuristic::WfMash {
+            min_wavefront_length,
+            max_distance_threshold,
+        } => (min_wavefront_length, max_distance_threshold),
+    };
+    assert!(
+        min_wavefront_length > 0,
+        "min_wavefront_length must be positive"
+    );
+    assert!(
+        max_distance_threshold >= 0,
+        "max_distance_threshold must be non-negative"
+    );
+}
+
+fn validate_drop_heuristic(drop_heuristic: DropHeuristic) {
+    match drop_heuristic {
+        DropHeuristic::XDrop { xdrop } => {
+            assert!(xdrop >= 0, "xdrop must be non-negative");
+        }
+        DropHeuristic::ZDrop { zdrop } => {
+            assert!(zdrop >= 0, "zdrop must be non-negative");
+        }
+    }
+}
+
+fn validate_band_heuristic(band: BandHeuristic) {
+    let (min_k, max_k) = match band {
+        BandHeuristic::Static { min_k, max_k } | BandHeuristic::Adaptive { min_k, max_k } => {
+            (min_k, max_k)
+        }
+    };
+    assert!(min_k <= max_k, "min_k must be less than or equal to max_k");
+}
+
+fn validate_heuristics_for_distance_metric(
+    heuristics: &Heuristics,
+    distance_metric: DistanceMetric,
+) {
+    if heuristics.drop_heuristic().is_some()
+        && matches!(
+            distance_metric,
+            DistanceMetric::Indel | DistanceMetric::Edit
+        )
+    {
+        panic!("drop heuristics are not compatible with edit or indel distance metrics");
+    }
+}
+
 #[derive(Debug, Copy, Clone)]
 struct WFAttributes {
     inner: wfa2::wavefront_aligner_attr_t,
@@ -251,9 +459,9 @@ struct WFAttributes {
 
 impl WFAttributes {
     fn default() -> Self {
-        Self {
-            inner: unsafe { wfa2::wavefront_aligner_attr_default },
-        }
+        let mut inner = unsafe { wfa2::wavefront_aligner_attr_default };
+        inner.heuristic.strategy = wfa2::wf_heuristic_strategy_wf_heuristic_none;
+        Self { inner }
     }
 
     fn memory_model(mut self, memory_model: MemoryModel) -> Self {
@@ -379,7 +587,7 @@ impl WFAttributes {
 pub struct WFAlignerBuilder {
     attributes: WFAttributes,
     penalty_set: bool,
-    heuristic: Option<Heuristic>,
+    heuristics: Option<Heuristics>,
 }
 
 impl WFAlignerBuilder {
@@ -390,7 +598,7 @@ impl WFAlignerBuilder {
         Self {
             attributes,
             penalty_set: false,
-            heuristic: None,
+            heuristics: None,
         }
     }
 
@@ -482,9 +690,10 @@ impl WFAlignerBuilder {
         self
     }
 
-    /// Set a heuristic for the aligner
-    pub fn with_heuristic(mut self, heuristic: Heuristic) -> Self {
-        self.heuristic = Some(heuristic);
+    /// Set heuristic configuration for the aligner.
+    pub fn with_heuristics(mut self, heuristics: Heuristics) -> Self {
+        heuristics.validate();
+        self.heuristics = Some(heuristics);
         self
     }
 
@@ -533,8 +742,8 @@ impl WFAlignerBuilder {
 
         let mut raw = WfaRawHandle::new(self.attributes);
 
-        if let Some(heuristic) = self.heuristic {
-            raw.set_heuristic(heuristic);
+        if let Some(heuristics) = self.heuristics {
+            raw.set_heuristics(heuristics);
         }
 
         WFAligner { raw }
@@ -674,34 +883,54 @@ impl WfaRawHandle {
         }
     }
 
-    fn heuristics(&self) -> Heuristic {
+    fn heuristics(&self) -> Heuristics {
         let h = &self.attributes.inner.heuristic;
-        match h.strategy {
-            wfa2::wf_heuristic_strategy_wf_heuristic_none => Heuristic::None,
-            wfa2::wf_heuristic_strategy_wf_heuristic_banded_static => {
-                Heuristic::BandedStatic(h.min_k, h.max_k)
-            }
-            wfa2::wf_heuristic_strategy_wf_heuristic_banded_adaptive => {
-                Heuristic::BandedAdaptive(h.min_k, h.max_k, h.steps_between_cutoffs)
-            }
-            wfa2::wf_heuristic_strategy_wf_heuristic_wfadaptive => Heuristic::WFadaptive(
-                h.min_wavefront_length,
-                h.max_distance_threshold,
-                h.steps_between_cutoffs,
-            ),
-            wfa2::wf_heuristic_strategy_wf_heuristic_wfmash => Heuristic::WFmash(
-                h.min_wavefront_length,
-                h.max_distance_threshold,
-                h.steps_between_cutoffs,
-            ),
-            wfa2::wf_heuristic_strategy_wf_heuristic_xdrop => {
-                Heuristic::XDrop(h.xdrop, h.steps_between_cutoffs)
-            }
-            wfa2::wf_heuristic_strategy_wf_heuristic_zdrop => {
-                Heuristic::ZDrop(h.zdrop, h.steps_between_cutoffs)
-            }
-            _ => panic!("Unknown heuristic strategy: {}", h.strategy),
+        let strategy = h.strategy;
+        let known_strategy = wfa2::wf_heuristic_strategy_wf_heuristic_banded_static
+            | wfa2::wf_heuristic_strategy_wf_heuristic_banded_adaptive
+            | wfa2::wf_heuristic_strategy_wf_heuristic_wfadaptive
+            | wfa2::wf_heuristic_strategy_wf_heuristic_wfmash
+            | wfa2::wf_heuristic_strategy_wf_heuristic_xdrop
+            | wfa2::wf_heuristic_strategy_wf_heuristic_zdrop;
+        if strategy & !known_strategy != 0 {
+            panic!("Unknown heuristic strategy: {}", strategy);
         }
+        if strategy == wfa2::wf_heuristic_strategy_wf_heuristic_none {
+            return Heuristics::new(h.steps_between_cutoffs);
+        }
+
+        let mut heuristics = Heuristics::new(h.steps_between_cutoffs);
+        if strategy & wfa2::wf_heuristic_strategy_wf_heuristic_wfadaptive != 0 {
+            heuristics = heuristics.with_adaptive(AdaptiveHeuristic::WfAdaptive {
+                min_wavefront_length: h.min_wavefront_length,
+                max_distance_threshold: h.max_distance_threshold,
+            });
+        } else if strategy & wfa2::wf_heuristic_strategy_wf_heuristic_wfmash != 0 {
+            heuristics = heuristics.with_adaptive(AdaptiveHeuristic::WfMash {
+                min_wavefront_length: h.min_wavefront_length,
+                max_distance_threshold: h.max_distance_threshold,
+            });
+        }
+
+        if strategy & wfa2::wf_heuristic_strategy_wf_heuristic_xdrop != 0 {
+            heuristics = heuristics.with_drop(DropHeuristic::XDrop { xdrop: h.xdrop });
+        } else if strategy & wfa2::wf_heuristic_strategy_wf_heuristic_zdrop != 0 {
+            heuristics = heuristics.with_drop(DropHeuristic::ZDrop { zdrop: h.zdrop });
+        }
+
+        if strategy & wfa2::wf_heuristic_strategy_wf_heuristic_banded_static != 0 {
+            heuristics = heuristics.with_band(BandHeuristic::Static {
+                min_k: h.min_k,
+                max_k: h.max_k,
+            });
+        } else if strategy & wfa2::wf_heuristic_strategy_wf_heuristic_banded_adaptive != 0 {
+            heuristics = heuristics.with_band(BandHeuristic::Adaptive {
+                min_k: h.min_k,
+                max_k: h.max_k,
+            });
+        }
+
+        heuristics
     }
 
     fn resource_limits(&self) -> ResourceLimits {
@@ -986,76 +1215,106 @@ impl WfaRawHandle {
         }
     }
 
-    fn set_heuristic(&mut self, heuristic: Heuristic) {
-        match heuristic {
-            Heuristic::None => {
-                self.attributes.inner.heuristic.strategy =
-                    wfa2::wf_heuristic_strategy_wf_heuristic_none;
-                unsafe {
-                    wfa2::wavefront_aligner_set_heuristic_none(self.inner);
+    fn set_heuristics(&mut self, heuristics: Heuristics) {
+        heuristics.validate();
+        validate_heuristics_for_distance_metric(&heuristics, self.distance_metric());
+
+        let cached = &mut self.attributes.inner.heuristic;
+        cached.strategy = wfa2::wf_heuristic_strategy_wf_heuristic_none;
+        cached.steps_between_cutoffs = heuristics.steps_between_cutoffs();
+
+        unsafe {
+            wfa2::wavefront_aligner_set_heuristic_none(self.inner);
+        }
+
+        if let Some(adaptive) = heuristics.adaptive() {
+            match adaptive {
+                AdaptiveHeuristic::WfAdaptive {
+                    min_wavefront_length,
+                    max_distance_threshold,
+                } => {
+                    cached.strategy |= wfa2::wf_heuristic_strategy_wf_heuristic_wfadaptive;
+                    cached.min_wavefront_length = min_wavefront_length;
+                    cached.max_distance_threshold = max_distance_threshold;
+                    unsafe {
+                        wfa2::wavefront_aligner_set_heuristic_wfadaptive(
+                            self.inner,
+                            min_wavefront_length,
+                            max_distance_threshold,
+                            heuristics.steps_between_cutoffs(),
+                        );
+                    }
+                }
+                AdaptiveHeuristic::WfMash {
+                    min_wavefront_length,
+                    max_distance_threshold,
+                } => {
+                    cached.strategy |= wfa2::wf_heuristic_strategy_wf_heuristic_wfmash;
+                    cached.min_wavefront_length = min_wavefront_length;
+                    cached.max_distance_threshold = max_distance_threshold;
+                    unsafe {
+                        wfa2::wavefront_aligner_set_heuristic_wfmash(
+                            self.inner,
+                            min_wavefront_length,
+                            max_distance_threshold,
+                            heuristics.steps_between_cutoffs(),
+                        );
+                    }
                 }
             }
-            Heuristic::WFadaptive(min_len, max_dist, steps) => {
-                self.attributes.inner.heuristic.strategy =
-                    wfa2::wf_heuristic_strategy_wf_heuristic_wfadaptive;
-                self.attributes.inner.heuristic.min_wavefront_length = min_len;
-                self.attributes.inner.heuristic.max_distance_threshold = max_dist;
-                self.attributes.inner.heuristic.steps_between_cutoffs = steps;
-                unsafe {
-                    wfa2::wavefront_aligner_set_heuristic_wfadaptive(
-                        self.inner, min_len, max_dist, steps,
-                    );
+        }
+
+        if let Some(drop_heuristic) = heuristics.drop_heuristic() {
+            match drop_heuristic {
+                DropHeuristic::XDrop { xdrop } => {
+                    cached.strategy |= wfa2::wf_heuristic_strategy_wf_heuristic_xdrop;
+                    cached.xdrop = xdrop;
+                    unsafe {
+                        wfa2::wavefront_aligner_set_heuristic_xdrop(
+                            self.inner,
+                            xdrop,
+                            heuristics.steps_between_cutoffs(),
+                        );
+                    }
+                }
+                DropHeuristic::ZDrop { zdrop } => {
+                    cached.strategy |= wfa2::wf_heuristic_strategy_wf_heuristic_zdrop;
+                    cached.zdrop = zdrop;
+                    unsafe {
+                        wfa2::wavefront_aligner_set_heuristic_zdrop(
+                            self.inner,
+                            zdrop,
+                            heuristics.steps_between_cutoffs(),
+                        );
+                    }
                 }
             }
-            Heuristic::WFmash(min_len, max_dist, steps) => {
-                self.attributes.inner.heuristic.strategy =
-                    wfa2::wf_heuristic_strategy_wf_heuristic_wfmash;
-                self.attributes.inner.heuristic.min_wavefront_length = min_len;
-                self.attributes.inner.heuristic.max_distance_threshold = max_dist;
-                self.attributes.inner.heuristic.steps_between_cutoffs = steps;
-                unsafe {
-                    wfa2::wavefront_aligner_set_heuristic_wfmash(
-                        self.inner, min_len, max_dist, steps,
-                    );
+        }
+
+        if let Some(band) = heuristics.band() {
+            match band {
+                BandHeuristic::Static { min_k, max_k } => {
+                    cached.strategy |= wfa2::wf_heuristic_strategy_wf_heuristic_banded_static;
+                    cached.min_k = min_k;
+                    cached.max_k = max_k;
+                    unsafe {
+                        wfa2::wavefront_aligner_set_heuristic_banded_static(
+                            self.inner, min_k, max_k,
+                        );
+                    }
                 }
-            }
-            Heuristic::XDrop(xdrop, steps) => {
-                self.attributes.inner.heuristic.strategy =
-                    wfa2::wf_heuristic_strategy_wf_heuristic_xdrop;
-                self.attributes.inner.heuristic.xdrop = xdrop;
-                self.attributes.inner.heuristic.steps_between_cutoffs = steps;
-                unsafe {
-                    wfa2::wavefront_aligner_set_heuristic_xdrop(self.inner, xdrop, steps);
-                }
-            }
-            Heuristic::ZDrop(zdrop, steps) => {
-                self.attributes.inner.heuristic.strategy =
-                    wfa2::wf_heuristic_strategy_wf_heuristic_zdrop;
-                self.attributes.inner.heuristic.zdrop = zdrop;
-                self.attributes.inner.heuristic.steps_between_cutoffs = steps;
-                unsafe {
-                    wfa2::wavefront_aligner_set_heuristic_zdrop(self.inner, zdrop, steps);
-                }
-            }
-            Heuristic::BandedStatic(min_k, max_k) => {
-                self.attributes.inner.heuristic.strategy =
-                    wfa2::wf_heuristic_strategy_wf_heuristic_banded_static;
-                self.attributes.inner.heuristic.min_k = min_k;
-                self.attributes.inner.heuristic.max_k = max_k;
-                unsafe {
-                    wfa2::wavefront_aligner_set_heuristic_banded_static(self.inner, min_k, max_k);
-                }
-            }
-            Heuristic::BandedAdaptive(min_k, max_k, steps) => {
-                self.attributes.inner.heuristic.strategy =
-                    wfa2::wf_heuristic_strategy_wf_heuristic_banded_adaptive;
-                self.attributes.inner.heuristic.min_k = min_k;
-                self.attributes.inner.heuristic.max_k = max_k;
-                self.attributes.inner.heuristic.steps_between_cutoffs = steps;
-                unsafe {
-                    wfa2::wavefront_aligner_set_heuristic_banded_adaptive(
-                        self.inner, min_k, max_k, steps,
-                    );
+                BandHeuristic::Adaptive { min_k, max_k } => {
+                    cached.strategy |= wfa2::wf_heuristic_strategy_wf_heuristic_banded_adaptive;
+                    cached.min_k = min_k;
+                    cached.max_k = max_k;
+                    unsafe {
+                        wfa2::wavefront_aligner_set_heuristic_banded_adaptive(
+                            self.inner,
+                            min_k,
+                            max_k,
+                            heuristics.steps_between_cutoffs(),
+                        );
+                    }
                 }
             }
         }
@@ -1127,7 +1386,7 @@ impl WFAligner {
         self.raw.penalties()
     }
 
-    pub fn get_heuristics(&self) -> Heuristic {
+    pub fn get_heuristics(&self) -> Heuristics {
         self.raw.heuristics()
     }
 
@@ -1184,8 +1443,8 @@ impl WFAligner {
         self.raw.cigar_score_clipped(flank_len)
     }
 
-    pub fn set_heuristic(&mut self, heuristic: Heuristic) {
-        self.raw.set_heuristic(heuristic);
+    pub fn set_heuristics(&mut self, heuristics: Heuristics) {
+        self.raw.set_heuristics(heuristics);
     }
 
     pub fn set_max_alignment_steps(&mut self, max_alignment_steps: i32) {
@@ -1629,8 +1888,8 @@ mod tests {
         let text = b"AGCAGGGCGTCATGCACAAGAAAGCTTTGCACTTTGCGAACCAACGATAGGTGGGGGTGCGTGGAGGATGGAACACGGACGGCCCGGCTTGCTGCCTTCCCAGGCCTGCAGTTTGCCCATCCACGTCAGGGCCTCAGCCTGGCCGAAAGAAAGAAATGGTCTGTGATCCCCCCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGCATTCCCGGCTACAAGGACCCTTCGAGCCCCGTTCGCCGGCCGCGGACCCGGCCCCTCCCTCCCCGGCCGCTAGGGGGCGGGCCCGGATCACAGGACTGGAGCTGGGCGGAGACCCACGCTCGGAGCGGTTGTGAACTGGCAGGCGGTGGGCGCGGCTTCTGTGCCGTGCCCCGGGCACTCAGTCTTCCAACGGGGCCCCGGAGTCGAAGACAGTTCTAGGGTTCAGGGAGCGCGGGCGGCTCCTGGGCGGCGCCAGACTGCGGTGAGTTGGCCGGCGTGGGCCACCAACCCAATGCAGCCCAGGGCGGCGGCACGAGACAGAACAACGGCGAACAGGAGCAGGGAAAGCGCCTCCGATAGGCCAGGCCTAGGGACCTGCGGGGAGAGGGCGAGGTCAACACCCGGCATGGGCCTCTGATTGGCTCCTGGGACTCGCCCCGCCTACGCCCATAGGTGGGCCCGCACTCTTCCCTGCGCCCCGCCCCCGCCCCAACAGCCT";
         let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
             .affine2p(8, 4, 2, 24, 1)
+            .with_heuristics(Heuristics::none())
             .build();
-        aligner.set_heuristic(Heuristic::None);
         let status = aligner.align_ends_free(pattern, 0, 0, text, 0, text.len() as i32);
         assert_eq!(status, AlignmentStatus::StatusAlgCompleted);
         let ((xstart, xend), (ystart, yend)) = aligner.get_alignment_span();
@@ -1896,7 +2155,7 @@ mod tests {
 
         let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
             .indel()
-            .with_heuristic(Heuristic::None)
+            .with_heuristics(Heuristics::none())
             .build();
         let status = aligner.align_end_to_end(&pattern, &text);
         assert_eq!(status, AlignmentStatus::StatusAlgCompleted);
@@ -1947,17 +2206,23 @@ mod tests {
     }
 
     #[test]
-    fn test_set_heuristic() {
+    fn test_set_heuristics_replaces_configuration() {
         let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
             .affine(6, 4, 2)
             .build();
-        aligner.set_heuristic(Heuristic::WFmash(1, 2, 3));
-        aligner.set_heuristic(Heuristic::BandedStatic(1, 2));
-        aligner.set_heuristic(Heuristic::BandedAdaptive(1, 2, 3));
-        aligner.set_heuristic(Heuristic::WFadaptive(1, 2, 3));
-        aligner.set_heuristic(Heuristic::XDrop(1, 2));
-        aligner.set_heuristic(Heuristic::ZDrop(1, 2));
-        aligner.set_heuristic(Heuristic::None);
+        let combined = Heuristics::new(3)
+            .with_adaptive(AdaptiveHeuristic::WfMash {
+                min_wavefront_length: 1,
+                max_distance_threshold: 2,
+            })
+            .with_drop(DropHeuristic::XDrop { xdrop: 10 })
+            .with_band(BandHeuristic::Adaptive { min_k: 1, max_k: 2 });
+        aligner.set_heuristics(combined);
+        assert_eq!(aligner.get_heuristics(), combined);
+
+        let replacement = Heuristics::banded_static(1, 2);
+        aligner.set_heuristics(replacement);
+        assert_eq!(aligner.get_heuristics(), replacement);
     }
 
     #[test]
@@ -2022,13 +2287,14 @@ mod tests {
 
         let mut aligner =
             WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryUltraLow)
+                .with_heuristics(Heuristics::wfa2_default())
                 .affine2p(8, 4, 2, 24, 1)
                 .build();
         let _status = aligner.align_end_to_end(read, allele);
         assert_eq!(_status, AlignmentStatus::StatusUnattainable);
         assert_eq!(aligner.score(), -2147483648);
 
-        aligner.set_heuristic(Heuristic::None);
+        aligner.set_heuristics(Heuristics::none());
         let _status = aligner.align_end_to_end(read, allele);
         assert_eq!(_status, AlignmentStatus::StatusAlgCompleted);
         assert_eq!(aligner.score(), -881);
@@ -2111,7 +2377,7 @@ mod tests {
 
         let aligner_affine = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryLow)
             .affine(12, 24, 2)
-            .with_heuristic(Heuristic::WFadaptive(10, 50, 100))
+            .with_heuristics(Heuristics::wf_adaptive(100, 10, 50))
             .build();
         assert_eq!(
             aligner_affine.get_penalties(),
@@ -2126,7 +2392,7 @@ mod tests {
         let aligner_affine_heuristic =
             WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryLow)
                 .affine(12, 24, 2)
-                .with_heuristic(Heuristic::WFadaptive(10, 50, 100))
+                .with_heuristics(Heuristics::wf_adaptive(100, 10, 50))
                 .build();
         assert_eq!(
             aligner_affine_heuristic.get_penalties(),
@@ -2257,36 +2523,40 @@ mod tests {
     }
 
     #[test]
-    fn test_get_heuristics() {
+    fn test_get_heuristics_round_trips_combined_categories() {
         let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
             .affine(12, 24, 2)
-            .with_heuristic(Heuristic::None)
             .build();
-        assert_eq!(aligner.get_heuristics(), Heuristic::None);
+        assert_eq!(aligner.get_heuristics(), Heuristics::none());
 
-        let wf_adaptive_heuristic = Heuristic::WFadaptive(5, 25, 50);
-        aligner.set_heuristic(wf_adaptive_heuristic);
-        assert_eq!(aligner.get_heuristics(), wf_adaptive_heuristic);
+        let empty_with_custom_steps = Heuristics::new(10);
+        aligner.set_heuristics(empty_with_custom_steps);
+        assert_eq!(aligner.get_heuristics(), empty_with_custom_steps);
 
-        let banded_static_heuristic = Heuristic::BandedStatic(5, 20);
-        aligner.set_heuristic(banded_static_heuristic);
-        assert_eq!(aligner.get_heuristics(), banded_static_heuristic);
+        let combined = Heuristics::new(5)
+            .with_adaptive(AdaptiveHeuristic::WfAdaptive {
+                min_wavefront_length: 5,
+                max_distance_threshold: 25,
+            })
+            .with_drop(DropHeuristic::XDrop { xdrop: 15 })
+            .with_band(BandHeuristic::Static {
+                min_k: 5,
+                max_k: 20,
+            });
+        aligner.set_heuristics(combined);
+        assert_eq!(aligner.get_heuristics(), combined);
 
-        let xdrop_heuristic = Heuristic::XDrop(15, 5);
-        aligner.set_heuristic(xdrop_heuristic);
-        assert_eq!(aligner.get_heuristics(), xdrop_heuristic);
-
-        let aligner_with_heuristic =
+        let aligner_with_heuristics =
             WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
                 .affine(12, 24, 2)
-                .with_heuristic(Heuristic::WFadaptive(10, 50, 100))
+                .with_heuristics(Heuristics::wf_adaptive(100, 10, 50))
                 .build();
         assert_eq!(
-            aligner_with_heuristic.get_heuristics(),
-            Heuristic::WFadaptive(10, 50, 100)
+            aligner_with_heuristics.get_heuristics(),
+            Heuristics::wf_adaptive(100, 10, 50)
         );
         assert_eq!(
-            aligner_with_heuristic.get_penalties(),
+            aligner_with_heuristics.get_penalties(),
             Penalties::Affine {
                 match_: 0,
                 mismatch: 12,
@@ -2294,6 +2564,78 @@ mod tests {
                 gap_extension: 2
             }
         );
+    }
+
+    #[test]
+    fn test_heuristics_none_clears_configuration() {
+        let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
+            .affine(12, 24, 2)
+            .with_heuristics(
+                Heuristics::new(5)
+                    .with_adaptive(AdaptiveHeuristic::WfAdaptive {
+                        min_wavefront_length: 5,
+                        max_distance_threshold: 25,
+                    })
+                    .with_drop(DropHeuristic::ZDrop { zdrop: 15 })
+                    .with_band(BandHeuristic::Adaptive {
+                        min_k: 5,
+                        max_k: 20,
+                    }),
+            )
+            .build();
+
+        aligner.set_heuristics(Heuristics::none());
+        assert!(aligner.get_heuristics().is_none());
+        assert_eq!(aligner.get_heuristics(), Heuristics::none());
+    }
+
+    #[test]
+    fn test_drop_heuristics_reject_edit_and_indel() {
+        assert!(std::panic::catch_unwind(|| {
+            let _ = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
+                .edit()
+                .with_heuristics(Heuristics::xdrop(1, 10))
+                .build();
+        })
+        .is_err());
+
+        assert!(std::panic::catch_unwind(|| {
+            let _ = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
+                .indel()
+                .with_heuristics(Heuristics::zdrop(1, 10))
+                .build();
+        })
+        .is_err());
+
+        let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
+            .edit()
+            .build();
+        assert!(std::panic::catch_unwind(move || {
+            aligner.set_heuristics(Heuristics::xdrop(1, 10));
+        })
+        .is_err());
+    }
+
+    #[test]
+    fn test_combined_heuristics_alignment_completes() {
+        let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
+            .affine(6, 4, 2)
+            .with_heuristics(
+                Heuristics::new(1)
+                    .with_adaptive(AdaptiveHeuristic::WfAdaptive {
+                        min_wavefront_length: 1,
+                        max_distance_threshold: 100,
+                    })
+                    .with_drop(DropHeuristic::XDrop { xdrop: 1_000 })
+                    .with_band(BandHeuristic::Static {
+                        min_k: -100,
+                        max_k: 100,
+                    }),
+            )
+            .build();
+
+        let status = aligner.align_end_to_end(PATTERN, TEXT);
+        assert_eq!(status, AlignmentStatus::StatusAlgCompleted);
     }
 
     #[test]

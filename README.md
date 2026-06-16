@@ -60,3 +60,29 @@ assert_eq!(
     b"MMMXMMMMDMMMMMMMIMMMMMMMMMXMMMMMM"
 );
 ```
+
+Heuristics are opt-in. WFA2 supports combining at most one adaptive heuristic,
+one drop heuristic, and one band heuristic:
+
+```rust
+use rust_wfa2::aligner::{
+    AdaptiveHeuristic, AlignmentScope, BandHeuristic, DropHeuristic, Heuristics, MemoryModel,
+    WFAligner,
+};
+
+let heuristics = Heuristics::new(10)
+    .with_adaptive(AdaptiveHeuristic::WfAdaptive {
+        min_wavefront_length: 10,
+        max_distance_threshold: 50,
+    })
+    .with_drop(DropHeuristic::XDrop { xdrop: 100 })
+    .with_band(BandHeuristic::Static {
+        min_k: -50,
+        max_k: 50,
+    });
+
+let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryLow)
+    .affine(6, 4, 2)
+    .with_heuristics(heuristics)
+    .build();
+```
