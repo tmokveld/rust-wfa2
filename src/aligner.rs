@@ -1017,6 +1017,16 @@ impl WfaRawHandle {
         self.align(pattern, text)
     }
 
+    fn reap(&mut self) {
+        if self.inner.is_null() {
+            panic!("Internal aligner pointer is null");
+        }
+
+        unsafe {
+            wfa2::wavefront_aligner_reap(self.inner);
+        }
+    }
+
     fn align(&mut self, pattern: &[u8], text: &[u8]) -> AlignmentResult {
         let raw_status = unsafe {
             wfa2::wavefront_align(
@@ -1465,6 +1475,19 @@ impl WFAligner {
         self.raw.align_extension(pattern, text)
     }
 
+    /// Reclaim reusable wavefront memory without destroying the aligner.
+    ///
+    /// This calls WFA2's explicit memory reclamation hook for buffered
+    /// wavefront, slab, and backtrace storage. The aligner's configuration is
+    /// preserved, and the next alignment reallocates internal buffers as needed.
+    ///
+    /// Call this after copying out any alignment result, CIGAR, or derived
+    /// alignment data you need to keep. It is valid to call before the first
+    /// alignment or multiple times in a row.
+    pub fn reap(&mut self) {
+        self.raw.reap();
+    }
+
     pub fn score(&self) -> i32 {
         self.raw.score()
     }
@@ -1720,6 +1743,35 @@ mod tests {
 
     fn raw_cigar_string(aligner: &WFAligner) -> String {
         String::from_utf8(aligner.cigar_operations()).unwrap()
+    }
+
+    #[test]
+    fn test_reap_preserves_aligner_for_reuse() {
+        let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
+            .edit()
+            .build();
+
+        aligner.reap();
+
+        let first_result = aligner.align_end_to_end(PATTERN, TEXT);
+        let first_cigar = aligner.cigar_operations();
+        assert_eq!(first_result.status, AlignmentStatus::StatusAlgCompleted);
+        assert_eq!(first_result.score, 7);
+        assert_eq!(first_cigar, b"MXMMMIMMMMMXXMMMMMMMMIMIMIMMMMMMMMM");
+
+        aligner.reap();
+        aligner.reap();
+
+        let second_pattern = b"TCTTTACTCGCGCGTTGGAGAAATACAATAGT";
+        let second_text = b"TCTATACTGCGCGTTTGGAGAAATAAAATAGT";
+        let second_result = aligner.align_end_to_end(second_pattern, second_text);
+
+        assert_eq!(second_result.status, AlignmentStatus::StatusAlgCompleted);
+        assert_eq!(second_result.score, 4);
+        assert_eq!(
+            aligner.cigar_operations(),
+            b"MMMXMMMMDMMMMMMMIMMMMMMMMMXMMMMMM"
+        );
     }
 
     #[test]
