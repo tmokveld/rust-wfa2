@@ -12,13 +12,28 @@ env:
 jobs:
   build:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: default
+            features: ""
+          - name: openmp
+            features: "--features openmp"
 
     steps:
       - name: Checkout repository and submodules
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
         with:
           submodules: recursive
-      - name: Build
-        run: cargo build --verbose
-      - name: Run tests
-        run: cargo test --verbose
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential clang cmake libclang-dev
+      - name: Check formatting
+        if: matrix.name == 'default'
+        run: cargo fmt --all --check
+      - name: Build workspace (${{ matrix.name }})
+        run: cargo build --workspace --all-targets --locked ${{ matrix.features }} --verbose
+      - name: Test workspace (${{ matrix.name }})
+        run: cargo test --workspace --all-targets --locked ${{ matrix.features }} --verbose

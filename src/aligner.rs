@@ -2,7 +2,12 @@ use crate::wfa2;
 use std::ffi::CString;
 use std::fmt;
 use std::io;
+use std::os::raw::c_char;
 use std::path::Path;
+
+// WFA2 defines DPMATRIX_DIAGONAL_NULL as INT_MAX. Bindgen does not emit
+// that macro consistently across libclang/platform combinations.
+const DPMATRIX_DIAGONAL_NULL: i32 = i32::MAX;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemoryModel {
@@ -1187,9 +1192,9 @@ impl WfaRawHandle {
         let raw_status = unsafe {
             wfa2::wavefront_align(
                 self.inner,
-                pattern.as_ptr() as *const i8,
+                pattern.as_ptr() as *const c_char,
                 pattern.len() as i32,
-                text.as_ptr() as *const i8,
+                text.as_ptr() as *const c_char,
                 text.len() as i32,
             )
         };
@@ -1260,9 +1265,7 @@ impl WfaRawHandle {
         }
 
         let end_pos = unsafe { (*self.inner).alignment_end_pos };
-        if end_pos.k == wfa2::DPMATRIX_DIAGONAL_NULL as i32
-            || end_pos.offset == wfa2::WAVEFRONT_OFFSET_NULL
-        {
+        if end_pos.k == DPMATRIX_DIAGONAL_NULL || end_pos.offset == wfa2::WAVEFRONT_OFFSET_NULL {
             return None;
         }
 
