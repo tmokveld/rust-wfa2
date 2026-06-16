@@ -380,9 +380,48 @@ struct CigarView<'a> {
 }
 
 impl CigarView<'_> {
-    fn active_operations(&self) -> &[std::os::raw::c_char] {
-        &self.operations[self.begin_offset as usize..self.end_offset as usize]
+    fn active_operation_bytes(&self) -> &[u8] {
+        let operations = &self.operations[self.begin_offset as usize..self.end_offset as usize];
+        // SAFETY: i8/u8 same layout, slice borrowed for 'self
+        unsafe { std::slice::from_raw_parts(operations.as_ptr() as *const u8, operations.len()) }
     }
+}
+
+fn alignment_span_from_ops(raw_operations: &[u8]) -> ((usize, usize), (usize, usize)) {
+    let mut pattern_index = 0;
+    let mut text_index = 0;
+
+    let mut pattern_start = None;
+    let mut text_start = None;
+    let mut pattern_end = 0;
+    let mut text_end = 0;
+
+    for &op in raw_operations {
+        match op {
+            b'I' => {
+                text_index += 1;
+            }
+            b'D' => {
+                pattern_index += 1;
+            }
+            b'M' | b'X' => {
+                pattern_start.get_or_insert(pattern_index);
+                text_start.get_or_insert(text_index);
+
+                pattern_index += 1;
+                text_index += 1;
+
+                pattern_end = pattern_index;
+                text_end = text_index;
+            }
+            _ => panic!("unexpected WFA operation: {}", op as char),
+        }
+    }
+
+    (
+        (pattern_start.unwrap_or(0), pattern_end),
+        (text_start.unwrap_or(0), text_end),
+    )
 }
 
 struct WfaRawHandle {
@@ -870,62 +909,24 @@ impl WFAligner {
     // TODO: THIS DOES NOT WORK WITH BIWFA
     pub fn get_alignment(&self) -> WfaAlign {
         let cigar = self.raw.cigar_view().unwrap();
-        let raw_operations = cigar.active_operations();
+        let raw_operations = cigar.active_operation_bytes();
 
         let mut operations = Vec::with_capacity(raw_operations.len());
-        for op in raw_operations {
-            let operation = WfaOp::from_u8(*op as u8);
+        for &op in raw_operations {
+            let operation = WfaOp::from_u8(op);
             operations.push(operation);
         }
 
         let (pattern_len, text_len) = self.raw.sequence_lengths();
 
-        let (xstart, xend, ystart, yend);
-
         // Check if alignment was end-to-end
         let is_global = self.raw.is_global_alignment();
         // For global alignment, span is always the full sequence lengths
-        if is_global {
-            xstart = 0;
-            ystart = 0;
-            xend = pattern_len;
-            yend = text_len;
+        let ((xstart, xend), (ystart, yend)) = if is_global {
+            ((0, pattern_len), (0, text_len))
         } else {
-            // For ends-free, we need to calculate the span
-            let mut pattern_index = 0;
-            let mut text_index = 0;
-            let mut is_span_started = false;
-            let (mut current_pattern_start, mut current_text_start) = (0, 0);
-            let (mut current_pattern_end, mut current_text_end) = (0, 0);
-
-            for op in &operations {
-                match op {
-                    WfaOp::Ins => {
-                        text_index += 1;
-                    }
-                    WfaOp::Del => {
-                        pattern_index += 1;
-                    }
-                    WfaOp::Match | WfaOp::Subst => {
-                        if !is_span_started {
-                            current_pattern_start = pattern_index;
-                            current_text_start = text_index;
-                            is_span_started = true;
-                        }
-                        pattern_index += 1;
-                        text_index += 1;
-                        current_pattern_end = pattern_index;
-                        current_text_end = text_index;
-                    }
-                }
-            }
-
-            // Handle cases where alignment might be purely indels (unlikely for ends-free) or if the loop didn't run. If span never started, ends remain 0. If it did start, the last match/mismatch determined the end
-            xstart = current_pattern_start;
-            ystart = current_text_start;
-            xend = current_pattern_end;
-            yend = current_text_end;
-        }
+            alignment_span_from_ops(raw_operations)
+        };
 
         WfaAlign {
             score: cigar.score,
@@ -939,7 +940,6 @@ impl WFAligner {
         }
     }
 
-    // TODO: Deprecate and use get_alignment?
     // TODO: THIS DOES NOT WORK WITH BIWFA
     pub fn get_alignment_span(&self) -> ((usize, usize), (usize, usize)) {
         // Check if alignment was end-to-end
@@ -950,32 +950,7 @@ impl WFAligner {
             ((0, pattern_len), (0, text_len))
         } else {
             let cigar = self.raw.cigar_view().unwrap();
-            let raw_operations = cigar.active_operations();
-
-            let mut pattern_index = 0;
-            let mut text_index = 0;
-            let mut is_span_started = false;
-            let (mut pattern_start, mut pattern_end, mut text_start, mut text_end) = (0, 0, 0, 0);
-
-            for &op in raw_operations {
-                match op as u8 {
-                    b'I' => text_index += 1,
-                    b'D' => pattern_index += 1,
-                    b'M' | b'X' => {
-                        if !is_span_started {
-                            pattern_start = pattern_index;
-                            text_start = text_index;
-                            is_span_started = true;
-                        }
-                        pattern_index += 1;
-                        text_index += 1;
-                        pattern_end = pattern_index;
-                        text_end = text_index;
-                    }
-                    _ => panic!("Unexpected operation"),
-                }
-            }
-            ((pattern_start, pattern_end), (text_start, text_end))
+            alignment_span_from_ops(cigar.active_operation_bytes())
         }
     }
 
@@ -991,7 +966,6 @@ impl WFAligner {
         cigar_str.to_vec()
     }
 
-    // TODO: Possibly remove safety checks?
     pub fn get_sam_cigar(&self, show_mismatches: bool) -> Vec<u32> {
         if self.raw.alignment_scope() == AlignmentScope::Score {
             panic!("Cannot get SAM CIGAR when AlignmentScope is Score");
@@ -1025,7 +999,6 @@ impl WFAligner {
     }
 
     /// Counts the number of match ('M') operations in the CIGAR string.
-    // TODO: Possibly remove safety checks?
     pub fn count_matches(&self) -> i32 {
         if self.raw.alignment_scope() == AlignmentScope::Score {
             panic!("Cannot count matches when AlignmentScope is Score");
@@ -1892,6 +1865,29 @@ mod tests {
                 gap_extension: 2
             }
         );
+    }
+
+    #[test]
+    fn test_alignment_span_from_ops() {
+        // Mixed: leading insertions offset the text start, trailing indels do not extend the span
+        assert_eq!(alignment_span_from_ops(b"IIIMMMDDXII"), ((0, 6), (3, 7)));
+        // No aligned columns at all -> empty span on both axes
+        assert_eq!(alignment_span_from_ops(b""), ((0, 0), (0, 0)));
+        assert_eq!(alignment_span_from_ops(b"DDII"), ((0, 0), (0, 0)));
+        assert_eq!(alignment_span_from_ops(b"III"), ((0, 0), (0, 0)));
+        assert_eq!(alignment_span_from_ops(b"DDD"), ((0, 0), (0, 0)));
+        // Single aligned column
+        assert_eq!(alignment_span_from_ops(b"M"), ((0, 1), (0, 1)));
+        // Substitutions advance both pattern and text just like matches
+        assert_eq!(alignment_span_from_ops(b"XXX"), ((0, 3), (0, 3)));
+        // Leading deletions offset the pattern start and leading insertions offset the text start
+        assert_eq!(alignment_span_from_ops(b"DDDMM"), ((3, 5), (0, 2)));
+        assert_eq!(alignment_span_from_ops(b"IIIMM"), ((0, 2), (3, 5)));
+        // Trailing indels after the last aligned column do not extend the span
+        assert_eq!(alignment_span_from_ops(b"MMIID"), ((0, 2), (0, 2)));
+        // Internal gaps diverge the pattern and text spans
+        assert_eq!(alignment_span_from_ops(b"MMDDMM"), ((0, 6), (0, 4)));
+        assert_eq!(alignment_span_from_ops(b"MMIIMM"), ((0, 4), (0, 6)));
     }
 
     #[test]
