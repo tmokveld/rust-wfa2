@@ -2934,6 +2934,24 @@ mod tests {
     }
 
     #[test]
+    fn test_dropped_alignment_trims_to_maximal_scoring_prefix() {
+        let pattern = b"AAAAAAAAAACCCCCCCCCCAAAAAAAAAA";
+        let text = b"AAAAAAAAAAGGGGGGGGGGAAAAAAAAAA";
+        let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
+            .affine_with_match(-1, 4, 6, 2)
+            .with_heuristics(Heuristics::zdrop(1, 0))
+            .build();
+
+        let result = aligner.align_end_to_end(pattern, text);
+        assert_eq!(result.status, AlignmentStatus::StatusAlgPartial);
+        assert!(result.dropped);
+        assert_eq!(aligner.score(), 10);
+        assert_eq!(aligner.cigar_string(None), "10M");
+        assert_eq!(aligner.cigar_score(), 10);
+        assert_eq!(aligner.get_alignment_span(), ((0, 10), (0, 10)));
+    }
+
+    #[test]
     fn test_alignment_span_from_ops() {
         // Mixed: leading insertions offset the text start, trailing indels do not extend the span.
         assert_eq!(alignment_span_from_ops(b"IIIMMMDDXII"), ((0, 6), (3, 7)));
