@@ -1146,6 +1146,10 @@ mod tests {
     const PATTERN: &[u8] = b"AGCTAGTGTCAATGGCTACTTTTCAGGTCCT";
     const TEXT: &[u8] = b"AACTAAGTGTCGGTGGCTACTATATATCAGGTCCT";
 
+    fn raw_cigar_string(aligner: &WFAligner) -> String {
+        String::from_utf8(aligner.cigar_operations()).unwrap()
+    }
+
     #[test]
     fn test_aligner_indel() {
         let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
@@ -1211,6 +1215,37 @@ mod tests {
     }
 
     #[test]
+    fn test_readme_end_to_end() {
+        let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryLow)
+            .affine(6, 4, 2)
+            .build();
+
+        let pattern = b"TCTTTACTCGCGCGTTGGAGAAATACAATAGT";
+        let text = b"TCTATACTGCGCGTTTGGAGAAATAAAATAGT";
+        let status = aligner.align_end_to_end(pattern, text);
+        assert_eq!(status, AlignmentStatus::StatusAlgCompleted);
+        assert_eq!(aligner.score(), -24);
+        assert_eq!(
+            aligner.cigar_operations(),
+            b"MMMXMMMMDMMMMMMMIMMMMMMMMMXMMMMMM"
+        );
+    }
+
+    #[test]
+    fn test_affine_with_match_long_gap() {
+        let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryLow)
+            .affine_with_match(-1, 2, 2, 1)
+            .build();
+
+        let pattern = b"ATAATA";
+        let text = b"ATACATAAAATA";
+        let status = aligner.align_end_to_end(pattern, text);
+        assert_eq!(status, AlignmentStatus::StatusAlgCompleted);
+        assert_eq!(aligner.score(), -2);
+        assert_eq!(raw_cigar_string(&aligner), "MMMIIIIIIMMM");
+    }
+
+    #[test]
     fn test_aligner_score_only() {
         let mut aligner = WFAligner::builder(AlignmentScope::Score, MemoryModel::MemoryLow)
             .affine(6, 4, 2)
@@ -1237,6 +1272,59 @@ mod tests {
             format!("{}\n{}\n{}", a, b, c),
             "AGCTA-GTGTCAATGGCTACT-T-T-TCAGGTCCT\n| ||| |||||  |||||||| | | |||||||||\nAACTAAGTGTCGGTGGCTACTATATATCAGGTCCT"
         );
+    }
+
+    #[test]
+    fn test_affine2p_with_match_long_gap() {
+        let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryLow)
+            .affine2p_with_match(-1, 3, 3, 3, 10, 0)
+            .build();
+
+        let pattern = b"TCTATAATAGT";
+        let text = b"TCTATACTGCGCGTTTGGAGAAATAAAATAGT";
+        let status = aligner.align_end_to_end(pattern, text);
+        assert_eq!(status, AlignmentStatus::StatusAlgCompleted);
+        assert_eq!(aligner.score(), 1);
+        assert_eq!(aligner.cigar_string(None), "6M21I5M");
+    }
+
+    #[test]
+    fn test_affine2p_with_zero_open() {
+        let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryLow)
+            .affine2p_with_match(-1, 3, 0, 4, 0, 10)
+            .build();
+
+        let pattern = b"TCTATAATAGT";
+        let text = b"TCTATACTGCGCGTTTGGAGAAATAAAATAGT";
+        let status = aligner.align_end_to_end(pattern, text);
+        assert_eq!(status, AlignmentStatus::StatusAlgCompleted);
+        assert_eq!(aligner.score(), -73);
+        assert_eq!(
+            raw_cigar_string(&aligner),
+            "MMMMMMIIIIIIIIIIIIMIIIIMMIIIIIMM"
+        );
+    }
+
+    #[test]
+    fn test_linear_and_affine_zero_open_score_equivalence() {
+        let pattern = b"ATAATA";
+        let text = b"ATACATAAAATA";
+
+        let mut affine_aligner =
+            WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryLow)
+                .affine_with_match(-1, 2, 0, 1)
+                .build();
+        let status = affine_aligner.align_end_to_end(pattern, text);
+        assert_eq!(status, AlignmentStatus::StatusAlgCompleted);
+        assert_eq!(affine_aligner.score(), 0);
+
+        let mut linear_aligner =
+            WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryLow)
+                .linear_with_match(-1, 2, 1)
+                .build();
+        let status = linear_aligner.align_end_to_end(pattern, text);
+        assert_eq!(status, AlignmentStatus::StatusAlgCompleted);
+        assert_eq!(linear_aligner.score(), 0);
     }
 
     #[test]
@@ -1288,6 +1376,70 @@ mod tests {
         assert_eq!(
             format!("{}\n{}\n{}", a, b, c),
             "-------------AATTTAAGTCTAGGCTACTTTC---------------\n             ||||||||| ||||||||||||               \nCCGACTACTACGAAATTTAAGTATAGGCTACTTTCCGTACGTACGTACGT"
+        );
+    }
+
+    #[test]
+    fn test_ends_free_with_match_penalties() {
+        let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryLow)
+            .affine_with_match(-1, 3, 2, 1)
+            .build();
+
+        let pattern = b"CGCGTTTGGAGAA";
+        let text = b"TCTATACTGCGCGTTTGGAGAAATAAAATAGT";
+        let pattern_size = pattern.len() as i32;
+        let text_size = text.len() as i32;
+        let status = aligner.align_ends_free(
+            pattern,
+            pattern_size,
+            pattern_size,
+            text,
+            text_size,
+            text_size,
+        );
+        assert_eq!(status, AlignmentStatus::StatusAlgCompleted);
+        assert_eq!(aligner.score(), 13);
+        assert_eq!(aligner.cigar_string(None), "9I13M10I");
+
+        let pattern = b"TCTATACTGCGCGTTTGGAGAAATAAAATAGT";
+        let text = b"CGCGTTTGGAGAA";
+        let pattern_size = pattern.len() as i32;
+        let text_size = text.len() as i32;
+        let status = aligner.align_ends_free(
+            pattern,
+            pattern_size,
+            pattern_size,
+            text,
+            text_size,
+            text_size,
+        );
+        assert_eq!(status, AlignmentStatus::StatusAlgCompleted);
+        assert_eq!(aligner.score(), 13);
+        assert_eq!(aligner.cigar_string(None), "9D13M10D");
+    }
+
+    #[test]
+    fn test_ends_free_shift() {
+        let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryLow)
+            .affine_with_match(-1, 3, 2, 1)
+            .build();
+
+        let pattern = b"TATATTTTTTTTGGAGAAATAAAATA";
+        let text = b"TCTATATTTTTTTTTGGAGAAATAAAATAGT";
+        let pattern_size = pattern.len() as i32;
+        let text_size = text.len() as i32;
+        let status = aligner.align_ends_free(
+            pattern,
+            pattern_size,
+            pattern_size,
+            text,
+            text_size,
+            text_size,
+        );
+        assert_eq!(status, AlignmentStatus::StatusAlgCompleted);
+        assert_eq!(
+            raw_cigar_string(&aligner),
+            "IIMMMMMMMMMMMMIMMMMMMMMMMMMMMII"
         );
     }
 
@@ -1344,6 +1496,20 @@ mod tests {
             format!("{}\n{}\n{}", a, b, c),
             "CGCGTCTGACTGACTGACTAAACTTTCATGTACCTGACA-----------------\n                   ||||||||| |||| |||||                 \n-------------------AAACTTTCACGTACGTGACATATAGCGATCGATGACT"
         );
+    }
+
+    #[test]
+    fn test_ends_free_wfa2_bug_73() {
+        let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
+            .linear_with_match(-1, 1, 1)
+            .build();
+
+        let pattern = b"A";
+        let text = b"ACG";
+        let status = aligner.align_ends_free(pattern, 0, 0, text, 0, 2);
+        assert_eq!(status, AlignmentStatus::StatusAlgCompleted);
+        assert_eq!(aligner.score(), 1);
+        assert_eq!(raw_cigar_string(&aligner), "MII");
     }
 
     #[test]
