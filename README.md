@@ -6,25 +6,25 @@ Rust language bindings for the excellent
 Work in progress. Tests and features are not yet complete.
 
 ## Autovectorization
+
 Remember to specify the correct C compiler! For me it is `CC=/usr/local/opt/llvm/bin/clang`.
 
 ## Usage
 
 ```rust
-use rust_wfa2::aligner::{AlignmentScope, AlignmentStatus, MemoryModel, WFAlignerGapAffine};
+use rust_wfa2::aligner::{AlignmentScope, AlignmentStatus, MemoryModel, WFAligner};
 
-let mut aligner =
-    WFAlignerGapAffine::new(6, 4, 2, AlignmentScope::Alignment, MemoryModel::MemoryLow);
+let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryLow)
+    .affine(6, 4, 2)
+    .build();
 
 let pattern = b"TCTTTACTCGCGCGTTGGAGAAATACAATAGT";
 let text = b"TCTATACTGCGCGTTTGGAGAAATAAAATAGT";
 let status = aligner.align_end_to_end(pattern, text);
-assert_eq!(status, AlignmentStatus::StatusSuccessful);
+assert_eq!(status, AlignmentStatus::StatusAlgCompleted);
 assert_eq!(aligner.score(), -24);
-assert_eq!(aligner.cigar(), "MMMXMMMMDMMMMMMMIMMMMMMMMMXMMMMMM");
-let (a, b, c) = aligner.matching(pattern, text);
 assert_eq!(
-    format!("{}\n{}\n{}", a, b, c),
-    "TCTTTACTCGCGCGTT-GGAGAAATACAATAGT\n|||||||| ||||||| ||||||||||||||||\nTCTATACT-GCGCGTTTGGAGAAATAAAATAGT"
+    aligner.cigar_operations(),
+    b"MMMXMMMMDMMMMMMMIMMMMMMMMMXMMMMMM"
 );
 ```
