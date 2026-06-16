@@ -2281,7 +2281,7 @@ mod tests {
     }
 
     #[test]
-    fn test_invalid_sequence() {
+    fn ultralow_memory_default_heuristic_can_be_unattainable() {
         let read = b"GCTGCTACTGGGGTGTCCCCTCTCAAAGGACAAACCCAGGATCTACAGATGTGTGTGCTAAGCCATGTATGCACATGCACGTGTGTGTGTATATATTTAACCTATCTGTATATATGTATTATGTAAACATGAGTTCCTGCTGGCATATCTGACTATAACTGACCACCTCAGGGTCCATTCTGATCTGTATATATGTATCATGTAAACATGAGTTCCCTGCTGGCATATCTGACTATAACTGACCACCTCACAGTCCATTCTGATCTCTATATATGTATTATGTAAACATGAGTTCCTACTGGCATATCTGACTATAACTGACCACCTCAGGGTCCATTCTGATCTGTATATATGTATTATGTAAACATGAGTTCCCTGCTGGCATATCTGATTATAACTGACCACCTCAGGGTCCATTCTGATCTGTATATATGTATTATGTAAACATGAGTTCCTACTGGCATATCTGACTATAACCGACCACCTCAGGGTCCATTCTGATCTGTATATATGTATCATGTAAACACGAGTTCCTACTGGCATATCTGACTATAACTGACCACCTCAGGGTCCATTCTGATCTGTATATATGTATCATGTAAACACGAGTTCCTGCTGGCATATCTGACTATAACTGACCACCTCAGGGTCCATTCTGATCTGTATATATGTATAATATATATTATATATGGACCTCAGGGTCCATTCTGATCTGTATATATGTATCATGTAAACATGAGTTCCTGCTGGCATATCTGACTATAACTGACCACCTCAGGGTCTATTCTGATCTGTATATATGTATAATATATATTATATATGGACCTCAGGGTCCATTCTGATCTGTATATATGTATCATGTAAACATGAGTTCCTGCTGGCATATCTGATTATAACCGACCACCTCAGGGTCCATTCTGATCTGTATATATGTATTATGTAAACATGAGTTCCTACTGGCATATCTGACTATAACCGACCACCTCAGGGTCCATTCTGATCTGTATATATGTATCATGTAAACATGAGTTCCTACTGGCATATCTGACTATAACTGACCACCTCAGGGTCCATTCTGATCTGTATATATGTATCATGTAAACATGAGTTCCTACTGGCATATCTGACTATAACTGACCACCTCAGGATCCATTCTGATCTGTATATATGTATAATATATATTATATATGGACCTCAGGGTCCATTCTGATCTGTATATATGTATAATATATATTATATATGGACCTCAGGGTCCATTCTGATCTGTATATATGTATCATGTAAACATGAGTTCCTGGCTGGCATATCTGATTATAACCGACCACCTCAGGGTCCATTCTGATCTGTATATATGTATCATGTAAACACGAGTTCCTACTGGCATATCTGACTATAACTGACCACCTCAGGGTCCATTCTGATCTGTATATATGTATCATGTAAACACGAGTTCCTGCTGGCATATCTGATTATAACCGACCACCTCAGGGTCCATTCTGATCTGTATATATGTATAATATATATTATATATGGACCTCAGGGTCCCCGCTGGCTTTTCCATGACTTCCTTATCCAGCTGTGAGAACCCTGACTCTTACTACCCATACTGTATTGACTTATTT";
         let allele = b"GCTGCTACTGGGGTGTCCCCTCTCAAAGGACAAACCCAGGATCTACAGATGTGTGTGCTAAGCCATGTATGCACACGCACGTGTGTGTGTATATATTTAACCTATCTGTATATATGTATTATGTAAACATGAGTTCCTGCTGGCATATCTGACTATAACTGACCACCTCAGGGTCCATTCTGATCTGTATATATGTATCATGTAAACACGACTTCCTACTGGCATATCTGACTGTAACCGACCACCTCAGGGTCCATTCTGATCTGTATATATGTATCATGTAAACATGATTTCCTACTGGCATATCTGACTATAACTGACCACCTCAGGGTTCATTCCGATCTGTATATAAGTATCATGTAAACACGAGTTCCTGCTGGCATATCTGACTGTAACCGACCACCTCAGGGTCCATTCTGATCTGTATATATGTATCATGTAAACACGAGTTCCTGCTGGCATATCTGACTATAACCGACCACCTCAGGGTCCATTCTGATCTGTATATATGTATCATGTAAACATGAGTTCCTACTGGCATATCTGACTATAACTGACCACCTCAGGGTCCATTCTGATCTGTATGTATGTATCATGTAAACACGAGTTCCTACTGGCATATCTGACTATAACTGACCACCTCAGGGTCCATTCCGATCTGTATATAAGTATCATGTAAACACGAGTTCCTGCTGGCATATCTGACTGTAACCGACCACCTCAGGGTCCATTCTGATCTGTATATATGTATCATGTAAACACGAGTTCCTGCTGGCATATCTGACTATAACTGACCACCTCAGGGTCCATTCTGATCTGTATATATGTATAATATATATTATATATGGACCTCAGGGTCCATTCTGATCTGCATATATGTATAATATATATTATATATGGACCTCAGGGTCCATTCTGATCTGTATATATGTATCATGTAAACATGAGTTCCTGCTGGCATATCTGTCTATAACCGACCACCTTAGGGTCCATTCTGATCTGTATATATGTATAATATATATTATATATGGTCCTCAGGGTCCATTCTGATCTGTATATATGTATCATGTAAACATGAGTTCCTGCTGGCATATCTGTCTATAACCGACCACCTTAGGGTCCATTCTGATCTGTATATATGTATAATATATATTATATATGGACCTCAGGGTCCATTCTGATCTGCATATATGTATAATATATATTATATATGGTCCTCAGGGTCCATTCTGATCTGTATATATGTATCATGTAAACATGAGTTCCTGCTGGCATATCTGTCTATAACCGACCACCTTAGGGTCCATTCTGATCTGTATATATGTATAATATATATTATATATGGACCTCAGGGTCCCCGCTGGCTTTTCCATGACTTCCTTATCCAGCTGTGAGAACCCTGACTCTTACTACTGTATTGACTTATTTGTGAAACCT";
 
@@ -2290,13 +2290,26 @@ mod tests {
                 .with_heuristics(Heuristics::wfa2_default())
                 .affine2p(8, 4, 2, 24, 1)
                 .build();
-        let _status = aligner.align_end_to_end(read, allele);
-        assert_eq!(_status, AlignmentStatus::StatusUnattainable);
-        assert_eq!(aligner.score(), -2147483648);
+
+        // These are valid sequence inputs, the unattainable result is specific to WFA2's
+        // BiWFA path when `wf_adaptive(1, 10, 50)` (i.e. `wfa2_default()`).
+        // For this pair, this heuristic prunes enough state that BiWFA reaches an end before it
+        // can find a midpoint breakpoint. The reached score is above WFA2's
+        // BiWFA recovery threshold, so WFA2 reports `WF_STATUS_UNATTAINABLE`.
+        let status = aligner.align_end_to_end(read, allele);
+        assert_eq!(status, AlignmentStatus::StatusUnattainable);
+        assert_eq!(aligner.score(), i32::MIN);
+
+        // Setting a more permissive heuristic allows BiWFA to find a midpoint
+        // breakpoint and recover with its regular fallback path.
+        aligner.set_heuristics(Heuristics::wf_adaptive(1, 10, 75));
+        let status = aligner.align_end_to_end(read, allele);
+        assert_eq!(status, AlignmentStatus::StatusAlgCompleted);
+        assert_eq!(aligner.score(), -881);
 
         aligner.set_heuristics(Heuristics::none());
-        let _status = aligner.align_end_to_end(read, allele);
-        assert_eq!(_status, AlignmentStatus::StatusAlgCompleted);
+        let status = aligner.align_end_to_end(read, allele);
+        assert_eq!(status, AlignmentStatus::StatusAlgCompleted);
         assert_eq!(aligner.score(), -881);
     }
 
@@ -2697,45 +2710,30 @@ mod tests {
         assert_eq!(alignment.yend, yend);
     }
 
-    // #[test]
-    // fn test_get_alignment_biwfa_global() {
-    //     let pattern = b"AGCTAGTGTCAATGGCTACTTTTCAGGTCCT";
-    //     let text = b"AACTAAGTGTCGGTGGCTACTATATATCAGGTCCT";
-    //     let mut aligner =
-    //         WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryUltraLow)
-    //             .affine(1, 5, 1)
-    //             .build();
-    //     let status = aligner.align_end_to_end(pattern, text);
-    //     assert_eq!(status, AlignmentStatus::StatusAlgCompleted);
+    #[test]
+    fn test_get_alignment_biwfa_global() {
+        let pattern = b"AGCTAGTGTCAATGGCTACTTTTCAGGTCCT";
+        let text = b"AACTAAGTGTCGGTGGCTACTATATATCAGGTCCT";
+        let mut aligner =
+            WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryUltraLow)
+                .affine(1, 5, 1)
+                .build();
+        let status = aligner.align_end_to_end(pattern, text);
+        assert_eq!(status, AlignmentStatus::StatusAlgCompleted);
 
-    //     let alignment = aligner.get_alignment();
-    //     assert_eq!(aligner.score(), -2147483648);
-    //     assert_eq!(aligner.cigar_score(), -18);
+        let alignment = aligner.get_alignment();
+        assert_eq!(aligner.score(), -18);
+        assert_eq!(aligner.cigar_score(), -18);
 
-    //     let expected_ops = vec![
-    //         Match, Subst, Match, Match, Match, Ins, Match, Match, Match, Match, Match, Subst,
-    //         Subst, Match, Match, Match, Match, Match, Match, Match, Match, Ins, Ins, Ins, Match,
-    //         Subst, Match, Match, Match, Match, Match, Match, Match, Match, Match,
-    //     ];
+        let expected_ops = vec![
+            Match, Subst, Match, Match, Match, Ins, Match, Match, Match, Match, Match, Subst,
+            Subst, Match, Match, Match, Match, Match, Match, Match, Match, Ins, Ins, Ins, Match,
+            Subst, Match, Match, Match, Match, Match, Match, Match, Match, Match,
+        ];
 
-    //     // WARN: score, xlen, and ylen cannot be relied on in biWFA mode!
-    //     assert_eq!(alignment.score, -2147483648);
-    //     assert_ne!(alignment.xlen, pattern.len());
-    //     assert_ne!(alignment.ylen, text.len());
-
-    //     assert_eq!(alignment.operations, expected_ops);
-
-    //     assert_eq!(alignment.xstart, 0);
-    //     assert_eq!(alignment.xend, 31);
-    //     assert_eq!(alignment.ystart, 0);
-    //     assert_eq!(alignment.yend, 35);
-
-    //     let ((xstart, xend), (ystart, yend)) = aligner.get_alignment_span();
-    //     assert_eq!(alignment.xstart, xstart);
-    //     assert_eq!(alignment.xend, xend);
-    //     assert_eq!(alignment.ystart, ystart);
-    //     assert_eq!(alignment.yend, yend);
-    // }
+        assert_eq!(alignment.score, -18);
+        assert_eq!(alignment.operations, expected_ops);
+    }
 
     #[test]
     fn test_get_alignment_ends_free() {
