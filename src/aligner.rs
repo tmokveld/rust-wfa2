@@ -772,6 +772,8 @@ struct CigarView<'a> {
     score: i32,
     begin_offset: i32,
     end_offset: i32,
+    end_v: i32,
+    end_h: i32,
     operations: &'a [std::os::raw::c_char],
 }
 
@@ -781,8 +783,22 @@ impl CigarView<'_> {
         // SAFETY: i8/u8 same layout, slice borrowed for 'self
         unsafe { std::slice::from_raw_parts(operations.as_ptr() as *const u8, operations.len()) }
     }
+
+    fn end_position(&self) -> Option<(usize, usize)> {
+        if self.end_v < 0 || self.end_h < 0 {
+            return None;
+        }
+
+        Some((self.end_v as usize, self.end_h as usize))
+    }
 }
 
+/// Derives the aligned span (start and end on both axes) from the active CIGAR operations.
+///
+/// Both leading and trailing indels are stripped, so the span covers only the aligned core
+/// (from the first to the last `M`/`X` column). This keeps the two axes symmetric and is used
+/// for ends-free/local alignments, which are always computed unidirectionally (BiWFA is rejected
+/// for those modes), so the full CIGAR is available here.
 fn alignment_span_from_ops(raw_operations: &[u8]) -> ((usize, usize), (usize, usize)) {
     let mut pattern_index = 0;
     let mut text_index = 0;
@@ -820,6 +836,14 @@ fn alignment_span_from_ops(raw_operations: &[u8]) -> ((usize, usize), (usize, us
     )
 }
 
+/// Derives the aligned span for an extension alignment from the active CIGAR operations.
+///
+/// Extension alignments are anchored at the origin, so the span always starts at `(0, 0)` and
+/// the end is simply the number of pattern/text characters consumed by the CIGAR. Unlike
+/// [`alignment_span_from_ops`], leading and trailing indels are *not* stripped (they advance the
+/// end on their axis). Deriving the span from the CIGAR rather than the wavefront end position
+/// keeps it consistent with the reported operations even when the maximal-scoring prefix is
+/// empty (a fully-trimmed extension yields an empty CIGAR and therefore a `(0, 0)` span).
 fn extension_alignment_span_from_ops(raw_operations: &[u8]) -> ((usize, usize), (usize, usize)) {
     let mut pattern_end = 0;
     let mut text_end = 0;
@@ -846,12 +870,20 @@ fn extension_alignment_span_from_ops(raw_operations: &[u8]) -> ((usize, usize), 
 struct WfaRawHandle {
     attributes: WFAttributes,
     inner: *mut wfa2::wavefront_aligner_t,
+    // Lengths of the last aligned pattern/text. This is the only reliable source for
+    // BiWFA (MemoryUltraLow), where the C aligner rewrites its `sequences` bounds during
+    // recursion and never restores the originals.
+    last_sequence_lengths: Option<(usize, usize)>,
 }
 
 impl WfaRawHandle {
     fn new(mut attributes: WFAttributes) -> Self {
         let inner = unsafe { wfa2::wavefront_aligner_new(&mut attributes.inner) };
-        Self { attributes, inner }
+        Self {
+            attributes,
+            inner,
+            last_sequence_lengths: None,
+        }
     }
 
     fn alignment_scope(&self) -> AlignmentScope {
@@ -999,6 +1031,19 @@ impl WfaRawHandle {
         text_begin_free: i32,
         text_end_free: i32,
     ) -> AlignmentResult {
+        if self.memory_model() == MemoryModel::MemoryUltraLow
+            && [
+                pattern_begin_free,
+                pattern_end_free,
+                text_begin_free,
+                text_end_free,
+            ]
+            .iter()
+            .any(|&free_ends| free_ends != 0)
+        {
+            panic!("Ends-free alignment is not supported with MemoryUltraLow");
+        }
+
         self.set_alignment_ends_free(
             pattern_begin_free,
             pattern_end_free,
@@ -1028,6 +1073,7 @@ impl WfaRawHandle {
     }
 
     fn align(&mut self, pattern: &[u8], text: &[u8]) -> AlignmentResult {
+        self.last_sequence_lengths = Some((pattern.len(), text.len()));
         let raw_status = unsafe {
             wfa2::wavefront_align(
                 self.inner,
@@ -1055,6 +1101,69 @@ impl WfaRawHandle {
             null_steps: status.num_null_steps,
             memory_used: status.memory_used,
         }
+    }
+
+    fn alignment_end_position(&self) -> Option<(usize, usize)> {
+        if self.inner.is_null() {
+            panic!("Internal aligner pointer is null");
+        }
+
+        let end_pos = unsafe { (*self.inner).alignment_end_pos };
+        if end_pos.k == wfa2::DPMATRIX_DIAGONAL_NULL as i32
+            || end_pos.offset == wfa2::WAVEFRONT_OFFSET_NULL
+        {
+            return None;
+        }
+
+        let pattern_end = end_pos.offset as i64 - end_pos.k as i64;
+        let text_end = end_pos.offset as i64;
+        if pattern_end < 0 || text_end < 0 {
+            return None;
+        }
+
+        Some((pattern_end as usize, text_end as usize))
+    }
+
+    fn alignment_span(&self) -> ((usize, usize), (usize, usize)) {
+        let cigar = self
+            .cigar_view()
+            .expect("CIGAR is null, alignment might have failed or scope was Score");
+        let status = self.alignment_result().status;
+        let (pattern_end, text_end) = cigar
+            .end_position()
+            .or_else(|| {
+                if self.is_global_alignment() && status == AlignmentStatus::StatusAlgCompleted {
+                    Some(self.sequence_lengths())
+                } else {
+                    None
+                }
+            })
+            .or_else(|| match status {
+                AlignmentStatus::StatusAlgCompleted | AlignmentStatus::StatusAlgPartial => {
+                    self.alignment_end_position()
+                }
+                AlignmentStatus::StatusMaxStepsReached
+                | AlignmentStatus::StatusOOM
+                | AlignmentStatus::StatusUnattainable => None,
+            })
+            .unwrap_or_else(|| panic!("No valid alignment span is available"));
+
+        if self.is_global_alignment() {
+            return ((0, pattern_end), (0, text_end));
+        }
+
+        // Extension and ends-free/local: derive the span directly from the active CIGAR so it
+        // stays consistent with the reported operations. The endpoint computed above still
+        // serves as a validity gate (it panics for failed alignments before we get here), but
+        // for these modes the CIGAR is the source of truth. Extension is anchored at the origin
+        // (so leading/trailing indels extend the span), whereas ends-free/local strip both to
+        // expose just the aligned core. Crucially, this keeps a fully-trimmed extension (empty
+        // CIGAR) reporting a `(0, 0)` span instead of the stale wavefront end position.
+        if self.is_extension_alignment() {
+            return extension_alignment_span_from_ops(cigar.active_operation_bytes());
+        }
+
+        alignment_span_from_ops(cigar.active_operation_bytes())
     }
 
     fn score(&self) -> i32 {
@@ -1163,6 +1272,8 @@ impl WfaRawHandle {
             score: cigar.score,
             begin_offset: cigar.begin_offset,
             end_offset: cigar.end_offset,
+            end_v: cigar.end_v,
+            end_h: cigar.end_h,
             operations,
         })
     }
@@ -1180,15 +1291,11 @@ impl WfaRawHandle {
     }
 
     fn sequence_lengths(&self) -> (usize, usize) {
-        if self.inner.is_null() {
-            panic!("Internal aligner pointer is null");
-        }
-        unsafe {
-            (
-                (*self.inner).sequences.pattern_length as usize,
-                (*self.inner).sequences.text_length as usize,
-            )
-        }
+        // Use the lengths captured at `align` time. Reading them back from the C aligner is
+        // unreliable for BiWFA (MemoryUltraLow): the top-level `sequences` is never populated
+        // and the bialigner's `wf_forward` is rewritten to sub-problem bounds during recursion.
+        self.last_sequence_lengths
+            .expect("Sequence lengths are unavailable; no alignment has been performed")
     }
 
     fn is_global_alignment(&self) -> bool {
@@ -1520,9 +1627,11 @@ impl WFAligner {
         self.raw.set_min_offsets_per_thread(min_offsets_per_thread);
     }
 
-    // TODO: Refactor
-    // TODO: THIS DOES NOT WORK WITH BIWFA
     pub fn get_alignment(&self) -> WfaAlign {
+        if self.raw.alignment_scope() == AlignmentScope::Score {
+            panic!("Cannot get alignment when AlignmentScope is Score");
+        }
+
         let cigar = self.raw.cigar_view().unwrap();
         let raw_operations = cigar.active_operation_bytes();
 
@@ -1533,18 +1642,7 @@ impl WFAligner {
         }
 
         let (pattern_len, text_len) = self.raw.sequence_lengths();
-
-        // Check if alignment was end-to-end
-        let is_global = self.raw.is_global_alignment();
-        let is_extension = self.raw.is_extension_alignment();
-        // For global alignment, span is always the full sequence lengths
-        let ((xstart, xend), (ystart, yend)) = if is_global {
-            ((0, pattern_len), (0, text_len))
-        } else if is_extension {
-            extension_alignment_span_from_ops(raw_operations)
-        } else {
-            alignment_span_from_ops(raw_operations)
-        };
+        let ((xstart, xend), (ystart, yend)) = self.raw.alignment_span();
 
         WfaAlign {
             score: cigar.score,
@@ -1558,22 +1656,12 @@ impl WFAligner {
         }
     }
 
-    // TODO: THIS DOES NOT WORK WITH BIWFA
     pub fn get_alignment_span(&self) -> ((usize, usize), (usize, usize)) {
-        // Check if alignment was end-to-end
-        let is_global = self.raw.is_global_alignment();
-        let is_extension = self.raw.is_extension_alignment();
-
-        if is_global {
-            let (pattern_len, text_len) = self.raw.sequence_lengths();
-            ((0, pattern_len), (0, text_len))
-        } else if is_extension {
-            let cigar = self.raw.cigar_view().unwrap();
-            extension_alignment_span_from_ops(cigar.active_operation_bytes())
-        } else {
-            let cigar = self.raw.cigar_view().unwrap();
-            alignment_span_from_ops(cigar.active_operation_bytes())
+        if self.raw.alignment_scope() == AlignmentScope::Score {
+            panic!("Cannot get alignment span when AlignmentScope is Score");
         }
+
+        self.raw.alignment_span()
     }
 
     pub fn cigar_operations(&self) -> Vec<u8> {
@@ -2134,6 +2222,40 @@ mod tests {
     }
 
     #[test]
+    fn test_aligner_extension_empty_prefix_has_zero_span() {
+        // No positive-scoring extension exists, so WFA2 trims the entire alignment away. The
+        // CIGAR ends up empty, and the span must stay consistent with that (an empty `(0, 0)`
+        // span) rather than reflecting the stale wavefront end position.
+        let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
+            .affine(6, 4, 2)
+            .build();
+
+        let result = aligner.align_extension(b"AAAAAAAA", b"TTTTTTTT");
+        assert_eq!(result.status, AlignmentStatus::StatusAlgPartial);
+        assert_eq!(aligner.cigar_string(None), "");
+
+        let alignment = aligner.get_alignment();
+        assert!(alignment.operations.is_empty());
+        assert_eq!(alignment.xstart, 0);
+        assert_eq!(alignment.xend, 0);
+        assert_eq!(alignment.ystart, 0);
+        assert_eq!(alignment.yend, 0);
+
+        assert_eq!(aligner.get_alignment_span(), ((0, 0), (0, 0)));
+    }
+
+    #[test]
+    fn test_extension_alignment_span_from_ops() {
+        // Anchored at the origin: leading and trailing indels extend the span (unlike the
+        // ends-free/local span, which strips them).
+        assert_eq!(extension_alignment_span_from_ops(b""), ((0, 0), (0, 0)));
+        assert_eq!(extension_alignment_span_from_ops(b"MMM"), ((0, 3), (0, 3)));
+        assert_eq!(extension_alignment_span_from_ops(b"IMMM"), ((0, 3), (0, 4)));
+        assert_eq!(extension_alignment_span_from_ops(b"MMMII"), ((0, 3), (0, 5)));
+        assert_eq!(extension_alignment_span_from_ops(b"DDMMX"), ((0, 5), (0, 3)));
+    }
+
+    #[test]
     fn test_aligner_extension_supports_score_scope() {
         let pattern = b"AATTTAAGTCTGCTACTTTCACGCAGCT";
         let text = b"AATTTCAGTCTGGCTACTTTCACGTACGATGACAGACTCT";
@@ -2158,6 +2280,17 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "Ends-free alignment is not supported with MemoryUltraLow")]
+    fn test_aligner_ends_free_rejects_ultralow_memory() {
+        let mut aligner =
+            WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryUltraLow)
+                .affine(6, 4, 2)
+                .build();
+
+        aligner.align_ends_free(b"ACGT", 0, 0, b"ACGT", 0, 1);
+    }
+
+    #[test]
     fn test_aligner_ends_free_left_extent() {
         let pattern = b"CTTTCACGTACGTGACAGTCTCT";
         let text = b"AATTTCAGTCTGGCTACTTTCACGTACGATGACAGACTCT";
@@ -2173,6 +2306,10 @@ mod tests {
             format!("{}\n{}\n{}", a, b, c),
             "----------------CTTTCACGTACG-TGACAGTCTCT\n                |||||||||||| |||||| ||||\nAATTTCAGTCTGGCTACTTTCACGTACGATGACAGACTCT"
         );
+
+        // Leading 16I is stripped (`ystart` = 16); there are no trailing indels, so the span
+        // runs to the end of both sequences.
+        assert_eq!(aligner.get_alignment_span(), ((0, 23), (16, 40)));
     }
 
     #[test]
@@ -2191,10 +2328,14 @@ mod tests {
             format!("{}\n{}\n{}", a, b, c),
             "CGCGTCTGACTGACTGACTAAACTTTCATGTACCTGACA-----------------\n                   ||||||||| |||| |||||                 \n-------------------AAACTTTCACGTACGTGACATATAGCGATCGATGACT"
         );
+
+        // The span is symmetric: leading 19D and trailing 17I are both stripped, so it covers
+        // only the aligned core. `yend` stops at the last M/X column (20), not the full text.
+        assert_eq!(aligner.get_alignment_span(), ((19, 39), (0, 20)));
     }
 
     #[test]
-    fn test_ends_free_wfa2_bug_73() {
+    fn test_ends_free_span_excludes_trailing_insertions() {
         let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
             .linear_with_match(-1, 1, 1)
             .build();
@@ -2205,6 +2346,10 @@ mod tests {
         assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
         assert_eq!(aligner.score(), 1);
         assert_eq!(raw_cigar_string(&aligner), "MII");
+
+        // The trailing II remain in the active CIGAR ("MII"), but the span strips trailing
+        // indels, so it covers only the single matched column.
+        assert_eq!(aligner.get_alignment_span(), ((0, 1), (0, 1)));
     }
 
     #[test]
@@ -2369,6 +2514,52 @@ mod tests {
         assert_eq!(result.status, AlignmentStatus::StatusMaxStepsReached);
         assert!(!result.dropped);
         assert!(result.null_steps >= 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "No valid alignment span is available")]
+    fn test_get_alignment_span_rejects_missing_cigar_end() {
+        let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
+            .with_max_alignment_steps(1)
+            .edit()
+            .build();
+
+        let result = aligner.align_end_to_end(PATTERN, TEXT);
+        assert_eq!(result.status, AlignmentStatus::StatusMaxStepsReached);
+        aligner.get_alignment_span();
+    }
+
+    #[test]
+    #[should_panic(expected = "No valid alignment span is available")]
+    fn test_get_alignment_rejects_missing_cigar_end() {
+        let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
+            .with_max_alignment_steps(1)
+            .edit()
+            .build();
+
+        let result = aligner.align_end_to_end(PATTERN, TEXT);
+        assert_eq!(result.status, AlignmentStatus::StatusMaxStepsReached);
+        aligner.get_alignment();
+    }
+
+    #[test]
+    #[should_panic(expected = "Cannot get alignment when AlignmentScope is Score")]
+    fn test_get_alignment_rejects_score_scope() {
+        let aligner = WFAligner::builder(AlignmentScope::Score, MemoryModel::MemoryHigh)
+            .edit()
+            .build();
+
+        aligner.get_alignment();
+    }
+
+    #[test]
+    #[should_panic(expected = "Cannot get alignment span when AlignmentScope is Score")]
+    fn test_get_alignment_span_rejects_score_scope() {
+        let aligner = WFAligner::builder(AlignmentScope::Score, MemoryModel::MemoryHigh)
+            .edit()
+            .build();
+
+        aligner.get_alignment_span();
     }
 
     #[test]
@@ -2744,23 +2935,23 @@ mod tests {
 
     #[test]
     fn test_alignment_span_from_ops() {
-        // Mixed: leading insertions offset the text start, trailing indels do not extend the span
+        // Mixed: leading insertions offset the text start, trailing indels do not extend the span.
         assert_eq!(alignment_span_from_ops(b"IIIMMMDDXII"), ((0, 6), (3, 7)));
-        // No aligned columns at all -> empty span on both axes
+        // No aligned columns at all -> empty span on both axes.
         assert_eq!(alignment_span_from_ops(b""), ((0, 0), (0, 0)));
         assert_eq!(alignment_span_from_ops(b"DDII"), ((0, 0), (0, 0)));
         assert_eq!(alignment_span_from_ops(b"III"), ((0, 0), (0, 0)));
         assert_eq!(alignment_span_from_ops(b"DDD"), ((0, 0), (0, 0)));
-        // Single aligned column
+        // Single aligned column.
         assert_eq!(alignment_span_from_ops(b"M"), ((0, 1), (0, 1)));
-        // Substitutions advance both pattern and text just like matches
+        // Substitutions advance both pattern and text just like matches.
         assert_eq!(alignment_span_from_ops(b"XXX"), ((0, 3), (0, 3)));
-        // Leading deletions offset the pattern start and leading insertions offset the text start
+        // Leading deletions offset the pattern start and leading insertions offset the text start.
         assert_eq!(alignment_span_from_ops(b"DDDMM"), ((3, 5), (0, 2)));
         assert_eq!(alignment_span_from_ops(b"IIIMM"), ((0, 2), (3, 5)));
-        // Trailing indels after the last aligned column do not extend the span
+        // Trailing indels after the last aligned column do not extend the span.
         assert_eq!(alignment_span_from_ops(b"MMIID"), ((0, 2), (0, 2)));
-        // Internal gaps diverge the pattern and text spans
+        // Internal gaps diverge the pattern and text spans.
         assert_eq!(alignment_span_from_ops(b"MMDDMM"), ((0, 6), (0, 4)));
         assert_eq!(alignment_span_from_ops(b"MMIIMM"), ((0, 4), (0, 6)));
     }
@@ -2823,7 +3014,60 @@ mod tests {
         ];
 
         assert_eq!(alignment.score, -18);
+        assert_eq!(alignment.xlen, pattern.len());
+        assert_eq!(alignment.ylen, text.len());
+        assert_eq!(alignment.xstart, 0);
+        assert_eq!(alignment.xend, pattern.len());
+        assert_eq!(alignment.ystart, 0);
+        assert_eq!(alignment.yend, text.len());
         assert_eq!(alignment.operations, expected_ops);
+
+        let ((xstart, xend), (ystart, yend)) = aligner.get_alignment_span();
+        assert_eq!(alignment.xstart, xstart);
+        assert_eq!(alignment.xend, xend);
+        assert_eq!(alignment.ystart, ystart);
+        assert_eq!(alignment.yend, yend);
+    }
+
+    #[test]
+    fn test_get_alignment_biwfa_global_long_recursion() {
+        // Sequences long and divergent enough to push BiWFA past its fallback thresholds
+        // (MIN_LENGTH = 100, MIN_SCORE = 250), forcing multiple recursive splits. Each split
+        // rewrites the C aligner's `wf_forward` sequence bounds, so the reported sequence
+        // lengths must come from the values captured at `align` time, not the C struct.
+        let bases = [b'A', b'C', b'G', b'T'];
+        let mut pattern = Vec::new();
+        let mut text = Vec::new();
+        let mut state: u64 = 0x9E3779B97F4A7C15;
+        let mut next_base = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            bases[((state >> 33) % 4) as usize]
+        };
+        for _ in 0..400 {
+            pattern.push(next_base());
+            text.push(next_base());
+        }
+
+        let mut aligner =
+            WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryUltraLow)
+                .affine(1, 5, 1)
+                .build();
+        let result = aligner.align_end_to_end(&pattern, &text);
+        assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
+
+        let alignment = aligner.get_alignment();
+        assert_eq!(alignment.xlen, pattern.len());
+        assert_eq!(alignment.ylen, text.len());
+        assert_eq!(alignment.xstart, 0);
+        assert_eq!(alignment.xend, pattern.len());
+        assert_eq!(alignment.ystart, 0);
+        assert_eq!(alignment.yend, text.len());
+
+        let ((xstart, xend), (ystart, yend)) = aligner.get_alignment_span();
+        assert_eq!((xstart, xend), (0, pattern.len()));
+        assert_eq!((ystart, yend), (0, text.len()));
     }
 
     #[test]
