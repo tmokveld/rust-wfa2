@@ -76,6 +76,67 @@ pub enum Heuristic {
     BandedAdaptive(i32, i32, i32),
 }
 
+/// Resource controls for bounding WFA2 alignment work.
+///
+/// If no resource setters are used, WFA2's default attribute values are:
+///
+/// - `max_alignment_steps`: `i32::MAX` (effectively unlimited)
+/// - `max_memory_resident`: `u64::MAX` (WFA2's automatic resident-memory sentinel)
+/// - `max_memory_abort`: `u64::MAX` (effectively unlimited)
+/// - `max_num_threads`: `1`
+/// - `min_offsets_per_thread`: `500`
+///
+/// `max_num_threads` only affects performance when `wfa2-sys` is built with
+/// the `openmp` feature. In testing, OpenMP was workload-sensitive and often
+/// flat or slower, so `1` is the safest default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResourceLimits {
+    /// Maximum WFA score steps before aborting with `StatusMaxStepsReached`.
+    ///
+    /// Default: `i32::MAX` (effectively unlimited).
+    pub max_alignment_steps: i32,
+    /// Memory threshold at which the aligner reaps buffered wavefront memory.
+    ///
+    /// Default: `u64::MAX`, used by WFA2 as its automatic resident-memory
+    /// sentinel.
+    pub max_memory_resident: u64,
+    /// Memory threshold at which the aligner aborts with `StatusOOM`.
+    ///
+    /// Default: `u64::MAX` (effectively unlimited).
+    pub max_memory_abort: u64,
+    /// Maximum number of worker threads used by WFA2.
+    ///
+    /// Default: `1`.
+    pub max_num_threads: i32,
+    /// Minimum wavefront offsets required before WFA2 starts another worker.
+    ///
+    /// Default: `500`.
+    pub min_offsets_per_thread: i32,
+}
+
+impl ResourceLimits {
+    pub fn new(
+        max_alignment_steps: i32,
+        max_memory_resident: u64,
+        max_memory_abort: u64,
+        max_num_threads: i32,
+        min_offsets_per_thread: i32,
+    ) -> Self {
+        validate_max_alignment_steps(max_alignment_steps);
+        validate_max_memory(max_memory_resident, max_memory_abort);
+        validate_max_num_threads(max_num_threads);
+        validate_min_offsets_per_thread(min_offsets_per_thread);
+
+        Self {
+            max_alignment_steps,
+            max_memory_resident,
+            max_memory_abort,
+            max_num_threads,
+            min_offsets_per_thread,
+        }
+    }
+}
+
 pub enum DistanceMetric {
     Indel,
     Edit,
@@ -158,6 +219,31 @@ impl From<i32> for AlignmentStatus {
     }
 }
 
+fn validate_max_alignment_steps(max_alignment_steps: i32) {
+    assert!(
+        max_alignment_steps > 0,
+        "max_alignment_steps must be positive"
+    );
+}
+
+fn validate_max_memory(max_memory_resident: u64, max_memory_abort: u64) {
+    assert!(
+        max_memory_resident <= max_memory_abort,
+        "max_memory_resident must be less than or equal to max_memory_abort"
+    );
+}
+
+fn validate_max_num_threads(max_num_threads: i32) {
+    assert!(max_num_threads > 0, "max_num_threads must be positive");
+}
+
+fn validate_min_offsets_per_thread(min_offsets_per_thread: i32) {
+    assert!(
+        min_offsets_per_thread > 0,
+        "min_offsets_per_thread must be positive"
+    );
+}
+
 #[derive(Debug, Copy, Clone)]
 struct WFAttributes {
     inner: wfa2::wavefront_aligner_attr_t,
@@ -187,6 +273,52 @@ impl WFAttributes {
             AlignmentScope::Alignment => wfa2::alignment_scope_t_compute_alignment,
         };
         self.inner.alignment_scope = alignment_scope;
+        self
+    }
+
+    fn resource_limits(&self) -> ResourceLimits {
+        let system = &self.inner.system;
+        ResourceLimits {
+            max_alignment_steps: system.max_alignment_steps,
+            max_memory_resident: system.max_memory_resident,
+            max_memory_abort: system.max_memory_abort,
+            max_num_threads: system.max_num_threads,
+            min_offsets_per_thread: system.min_offsets_per_thread,
+        }
+    }
+
+    fn set_resource_limits(mut self, resource_limits: ResourceLimits) -> Self {
+        self = self.max_alignment_steps(resource_limits.max_alignment_steps);
+        self = self.max_memory(
+            resource_limits.max_memory_resident,
+            resource_limits.max_memory_abort,
+        );
+        self = self.max_num_threads(resource_limits.max_num_threads);
+        self.min_offsets_per_thread(resource_limits.min_offsets_per_thread)
+    }
+
+    fn max_alignment_steps(mut self, max_alignment_steps: i32) -> Self {
+        validate_max_alignment_steps(max_alignment_steps);
+        self.inner.system.max_alignment_steps = max_alignment_steps;
+        self
+    }
+
+    fn max_memory(mut self, max_memory_resident: u64, max_memory_abort: u64) -> Self {
+        validate_max_memory(max_memory_resident, max_memory_abort);
+        self.inner.system.max_memory_resident = max_memory_resident;
+        self.inner.system.max_memory_abort = max_memory_abort;
+        self
+    }
+
+    fn max_num_threads(mut self, max_num_threads: i32) -> Self {
+        validate_max_num_threads(max_num_threads);
+        self.inner.system.max_num_threads = max_num_threads;
+        self
+    }
+
+    fn min_offsets_per_thread(mut self, min_offsets_per_thread: i32) -> Self {
+        validate_min_offsets_per_thread(min_offsets_per_thread);
+        self.inner.system.min_offsets_per_thread = min_offsets_per_thread;
         self
     }
 
@@ -356,6 +488,43 @@ impl WFAlignerBuilder {
         self
     }
 
+    /// Set all resource limits at once.
+    pub fn with_resource_limits(mut self, resource_limits: ResourceLimits) -> Self {
+        self.attributes = self.attributes.set_resource_limits(resource_limits);
+        self
+    }
+
+    /// Set the maximum WFA score steps before aborting with `StatusMaxStepsReached`.
+    pub fn with_max_alignment_steps(mut self, max_alignment_steps: i32) -> Self {
+        self.attributes = self.attributes.max_alignment_steps(max_alignment_steps);
+        self
+    }
+
+    /// Set WFA2 memory thresholds in bytes.
+    ///
+    /// `max_memory_resident` controls when resident buffered memory is reaped.
+    /// `max_memory_abort` controls when alignment aborts with `StatusOOM`.
+    pub fn with_max_memory(mut self, max_memory_resident: u64, max_memory_abort: u64) -> Self {
+        self.attributes = self
+            .attributes
+            .max_memory(max_memory_resident, max_memory_abort);
+        self
+    }
+
+    /// Set the maximum number of worker threads used by WFA2.
+    pub fn with_max_num_threads(mut self, max_num_threads: i32) -> Self {
+        self.attributes = self.attributes.max_num_threads(max_num_threads);
+        self
+    }
+
+    /// Set the minimum wavefront offsets required before WFA2 starts another worker.
+    pub fn with_min_offsets_per_thread(mut self, min_offsets_per_thread: i32) -> Self {
+        self.attributes = self
+            .attributes
+            .min_offsets_per_thread(min_offsets_per_thread);
+        self
+    }
+
     /// Build the WFAligner with the configured settings
     pub fn build(self) -> WFAligner {
         if !self.penalty_set {
@@ -497,6 +666,10 @@ impl WfaRawHandle {
             }
             _ => panic!("Unknown heuristic strategy: {}", h.strategy),
         }
+    }
+
+    fn resource_limits(&self) -> ResourceLimits {
+        self.attributes.resource_limits()
     }
 
     fn set_alignment_end_to_end(&mut self) {
@@ -829,6 +1002,43 @@ impl WfaRawHandle {
             }
         }
     }
+
+    fn set_max_alignment_steps(&mut self, max_alignment_steps: i32) {
+        validate_max_alignment_steps(max_alignment_steps);
+        self.attributes.inner.system.max_alignment_steps = max_alignment_steps;
+        unsafe {
+            wfa2::wavefront_aligner_set_max_alignment_steps(self.inner, max_alignment_steps);
+        }
+    }
+
+    fn set_max_memory(&mut self, max_memory_resident: u64, max_memory_abort: u64) {
+        validate_max_memory(max_memory_resident, max_memory_abort);
+        self.attributes.inner.system.max_memory_resident = max_memory_resident;
+        self.attributes.inner.system.max_memory_abort = max_memory_abort;
+        unsafe {
+            wfa2::wavefront_aligner_set_max_memory(
+                self.inner,
+                max_memory_resident,
+                max_memory_abort,
+            );
+        }
+    }
+
+    fn set_max_num_threads(&mut self, max_num_threads: i32) {
+        validate_max_num_threads(max_num_threads);
+        self.attributes.inner.system.max_num_threads = max_num_threads;
+        unsafe {
+            wfa2::wavefront_aligner_set_max_num_threads(self.inner, max_num_threads);
+        }
+    }
+
+    fn set_min_offsets_per_thread(&mut self, min_offsets_per_thread: i32) {
+        validate_min_offsets_per_thread(min_offsets_per_thread);
+        self.attributes.inner.system.min_offsets_per_thread = min_offsets_per_thread;
+        unsafe {
+            wfa2::wavefront_aligner_set_min_offsets_per_thread(self.inner, min_offsets_per_thread);
+        }
+    }
 }
 
 impl Drop for WfaRawHandle {
@@ -861,6 +1071,10 @@ impl WFAligner {
 
     pub fn get_heuristics(&self) -> Heuristic {
         self.raw.heuristics()
+    }
+
+    pub fn get_resource_limits(&self) -> ResourceLimits {
+        self.raw.resource_limits()
     }
 }
 
@@ -903,6 +1117,23 @@ impl WFAligner {
 
     pub fn set_heuristic(&mut self, heuristic: Heuristic) {
         self.raw.set_heuristic(heuristic);
+    }
+
+    pub fn set_max_alignment_steps(&mut self, max_alignment_steps: i32) {
+        self.raw.set_max_alignment_steps(max_alignment_steps);
+    }
+
+    pub fn set_max_memory(&mut self, max_memory_resident: u64, max_memory_abort: u64) {
+        self.raw
+            .set_max_memory(max_memory_resident, max_memory_abort);
+    }
+
+    pub fn set_max_num_threads(&mut self, max_num_threads: i32) {
+        self.raw.set_max_num_threads(max_num_threads);
+    }
+
+    pub fn set_min_offsets_per_thread(&mut self, min_offsets_per_thread: i32) {
+        self.raw.set_min_offsets_per_thread(min_offsets_per_thread);
     }
 
     // TODO: Refactor
@@ -1584,6 +1815,61 @@ mod tests {
         aligner.set_heuristic(Heuristic::XDrop(1, 2));
         aligner.set_heuristic(Heuristic::ZDrop(1, 2));
         aligner.set_heuristic(Heuristic::None);
+    }
+
+    #[test]
+    fn test_resource_limits_builder_and_setters() {
+        let initial_limits = ResourceLimits::new(64, 1_048_576, 2_097_152, 1, 64);
+        let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
+            .with_resource_limits(initial_limits)
+            .affine(6, 4, 2)
+            .build();
+        assert_eq!(aligner.get_resource_limits(), initial_limits);
+
+        aligner.set_max_alignment_steps(128);
+        aligner.set_max_memory(2_097_152, 4_194_304);
+        aligner.set_max_num_threads(2);
+        aligner.set_min_offsets_per_thread(32);
+
+        assert_eq!(
+            aligner.get_resource_limits(),
+            ResourceLimits {
+                max_alignment_steps: 128,
+                max_memory_resident: 2_097_152,
+                max_memory_abort: 4_194_304,
+                max_num_threads: 2,
+                min_offsets_per_thread: 32,
+            }
+        );
+
+        let aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
+            .with_max_alignment_steps(256)
+            .with_max_memory(4_194_304, 8_388_608)
+            .with_max_num_threads(1)
+            .with_min_offsets_per_thread(128)
+            .affine(6, 4, 2)
+            .build();
+        assert_eq!(
+            aligner.get_resource_limits(),
+            ResourceLimits {
+                max_alignment_steps: 256,
+                max_memory_resident: 4_194_304,
+                max_memory_abort: 8_388_608,
+                max_num_threads: 1,
+                min_offsets_per_thread: 128,
+            }
+        );
+    }
+
+    #[test]
+    fn test_max_alignment_steps_limit() {
+        let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
+            .with_max_alignment_steps(1)
+            .edit()
+            .build();
+
+        let status = aligner.align_end_to_end(PATTERN, TEXT);
+        assert_eq!(status, AlignmentStatus::StatusMaxStepsReached);
     }
 
     #[test]

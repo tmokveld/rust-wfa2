@@ -9,6 +9,38 @@ Work in progress. Tests and features are not yet complete.
 
 Remember to specify the correct C compiler! For me it is `CC=/usr/local/opt/llvm/bin/clang`.
 
+## OpenMP
+
+OpenMP support is opt-in. The default build stays serial and avoids an OpenMP
+runtime dependency.
+
+```sh
+cargo build --release --features openmp
+```
+
+In testing, WFA2's OpenMP path did not provide reliable speedups for the
+workloads tried.
+
+On Linux, GCC/libgomp is the default OpenMP runtime:
+
+```sh
+CC=gcc CXX=g++ cargo build --release --features openmp
+```
+
+On macOS with Homebrew LLVM/libomp:
+
+```sh
+LLVM_PREFIX="$(brew --prefix llvm)" \
+LIBOMP_PREFIX="$(brew --prefix libomp)" \
+CC="$(brew --prefix llvm)/bin/clang" \
+CXX="$(brew --prefix llvm)/bin/clang++" \
+cargo build --release --features openmp
+```
+
+Use `WFA2_OPENMP_LIB=omp` or `WFA2_OPENMP_LIB=gomp` to override the runtime
+linked by Cargo, and `WFA2_OPENMP_LIB_DIR` if the runtime is in a non-standard
+library directory.
+
 ## Usage
 
 ```rust
