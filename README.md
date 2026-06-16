@@ -61,6 +61,28 @@ assert_eq!(
 );
 ```
 
+### WFA2 plot dumps
+
+WFA2's native wavefront plot recorder is available for debugging and tooling.
+It writes WFA2's `.plot` text format; PNG rendering is left to external tools
+such as WFA2's `scripts/wfa.plot.py`.
+
+```rust
+use rust_wfa2::aligner::{AlignmentScope, AlignmentStatus, MemoryModel, PlotOptions, WFAligner};
+
+let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
+    .with_plotting(PlotOptions::default())
+    .affine(6, 4, 2)
+    .build();
+
+let result = aligner.align_end_to_end(
+    b"TCTTTACTCGCGCGTTGGAGAAATACAATAGT",
+    b"TCTATACTGCGCGTTTGGAGAAATAAAATAGT",
+);
+assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
+aligner.write_plot("debug.plot").unwrap();
+```
+
 Heuristics are opt-in. WFA2 supports combining at most one adaptive heuristic,
 one drop heuristic, and one band heuristic:
 

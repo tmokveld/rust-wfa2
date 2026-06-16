@@ -1,5 +1,8 @@
 use crate::wfa2;
+use std::ffi::CString;
 use std::fmt;
+use std::io;
+use std::path::Path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemoryModel {
@@ -259,6 +262,62 @@ pub struct ResourceLimits {
     pub min_offsets_per_thread: i32,
 }
 
+/// Options for recording WFA2's native wavefront plot dump.
+///
+/// Plotting is intended for debugging and external tooling. It records
+/// WFA2's upstream `.plot` text format during alignment; it does not render an
+/// image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlotOptions {
+    /// Total heatmap resolution points used by WFA2's plot recorder.
+    ///
+    /// Default: `2000`.
+    pub resolution_points: i32,
+    /// BiWFA recursion level to record. `-1` records the final/subsidiary
+    /// alignment, and non-negative values record that recursion level.
+    ///
+    /// Default: `0`.
+    pub align_level: i32,
+}
+
+impl Default for PlotOptions {
+    fn default() -> Self {
+        Self {
+            resolution_points: 2000,
+            align_level: 0,
+        }
+    }
+}
+
+impl PlotOptions {
+    pub fn new(resolution_points: i32, align_level: i32) -> Self {
+        validate_plot_options(resolution_points, align_level);
+        Self {
+            resolution_points,
+            align_level,
+        }
+    }
+
+    pub fn final_alignment() -> Self {
+        Self {
+            align_level: -1,
+            ..Self::default()
+        }
+    }
+
+    pub fn at_recursion_level(level: i32) -> Self {
+        validate_plot_options(Self::default().resolution_points, level);
+        Self {
+            align_level: level,
+            ..Self::default()
+        }
+    }
+
+    fn validate(&self) {
+        validate_plot_options(self.resolution_points, self.align_level);
+    }
+}
+
 impl ResourceLimits {
     pub fn new(
         max_alignment_steps: i32,
@@ -456,6 +515,36 @@ fn validate_band_heuristic(band: BandHeuristic) {
     assert!(min_k <= max_k, "min_k must be less than or equal to max_k");
 }
 
+fn validate_plot_options(resolution_points: i32, align_level: i32) {
+    assert!(resolution_points > 0, "resolution_points must be positive");
+    assert!(
+        align_level >= -1,
+        "align_level must be greater than or equal to -1"
+    );
+}
+
+#[cfg(unix)]
+fn path_to_cstring(path: &Path) -> io::Result<CString> {
+    use std::os::unix::ffi::OsStrExt;
+
+    CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "plot path contains an interior NUL byte",
+        )
+    })
+}
+
+#[cfg(not(unix))]
+fn path_to_cstring(path: &Path) -> io::Result<CString> {
+    CString::new(path.as_os_str().to_string_lossy().as_bytes()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "plot path contains an interior NUL byte",
+        )
+    })
+}
+
 fn validate_heuristics_for_distance_metric(
     heuristics: &Heuristics,
     distance_metric: DistanceMetric,
@@ -545,6 +634,14 @@ impl WFAttributes {
     fn min_offsets_per_thread(mut self, min_offsets_per_thread: i32) -> Self {
         validate_min_offsets_per_thread(min_offsets_per_thread);
         self.inner.system.min_offsets_per_thread = min_offsets_per_thread;
+        self
+    }
+
+    fn plotting(mut self, plot_options: PlotOptions) -> Self {
+        plot_options.validate();
+        self.inner.plot.enabled = true;
+        self.inner.plot.resolution_points = plot_options.resolution_points;
+        self.inner.plot.align_level = plot_options.align_level;
         self
     }
 
@@ -749,6 +846,15 @@ impl WFAlignerBuilder {
         self.attributes = self
             .attributes
             .min_offsets_per_thread(min_offsets_per_thread);
+        self
+    }
+
+    /// Enable WFA2's native `.plot` dump recorder.
+    ///
+    /// Call [`WFAligner::write_plot`] after an alignment run to write the dump
+    /// to a file. This is a debugging/tooling format, not an image renderer.
+    pub fn with_plotting(mut self, plot_options: PlotOptions) -> Self {
+        self.attributes = self.attributes.plotting(plot_options);
         self
     }
 
@@ -1072,6 +1178,10 @@ impl WfaRawHandle {
         }
     }
 
+    fn plotting_enabled(&self) -> bool {
+        self.attributes.inner.plot.enabled
+    }
+
     fn align(&mut self, pattern: &[u8], text: &[u8]) -> AlignmentResult {
         self.last_sequence_lengths = Some((pattern.len(), text.len()));
         let raw_status = unsafe {
@@ -1086,6 +1196,47 @@ impl WfaRawHandle {
         let result = self.alignment_result();
         debug_assert_eq!(result.status, AlignmentStatus::from(raw_status));
         result
+    }
+
+    fn write_plot<P: AsRef<Path>>(&self, path: P) -> io::Result<()> {
+        if !self.plotting_enabled() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "WFA2 plotting was not enabled when the aligner was built",
+            ));
+        }
+
+        if self.last_sequence_lengths.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cannot write a WFA2 plot before running an alignment",
+            ));
+        }
+
+        if self.inner.is_null() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "internal aligner pointer is null",
+            ));
+        }
+
+        let c_path = path_to_cstring(path.as_ref())?;
+        let mode = CString::new("w").expect("static fopen mode contains no NUL byte");
+        let stream = unsafe { wfa2::fopen(c_path.as_ptr(), mode.as_ptr()) };
+        if stream.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+
+        unsafe {
+            wfa2::wavefront_plot_print(stream, self.inner);
+        }
+
+        let close_result = unsafe { wfa2::fclose(stream) };
+        if close_result == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
     }
 
     fn alignment_result(&self) -> AlignmentResult {
@@ -1595,6 +1746,16 @@ impl WFAligner {
         self.raw.reap();
     }
 
+    /// Write WFA2's native `.plot` dump for the last alignment to `path`.
+    ///
+    /// The aligner must have been built with [`WFAlignerBuilder::with_plotting`]
+    /// and an alignment must have been run first. This writes WFA2's upstream
+    /// text dump; rendering PNGs is left to external tooling such as WFA2's
+    /// `wfa.plot.py` script.
+    pub fn write_plot<P: AsRef<Path>>(&self, path: P) -> io::Result<()> {
+        self.raw.write_plot(path)
+    }
+
     pub fn score(&self) -> i32 {
         self.raw.score()
     }
@@ -1824,13 +1985,40 @@ impl WFAligner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
     use WfaOp::*;
 
     const PATTERN: &[u8] = b"AGCTAGTGTCAATGGCTACTTTTCAGGTCCT";
     const TEXT: &[u8] = b"AACTAAGTGTCGGTGGCTACTATATATCAGGTCCT";
+    static PLOT_TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     fn raw_cigar_string(aligner: &WFAligner) -> String {
         String::from_utf8(aligner.cigar_operations()).unwrap()
+    }
+
+    fn temp_plot_path(test_name: &str) -> PathBuf {
+        let id = PLOT_TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "rust_wfa2_{test_name}_{}_{}.plot",
+            std::process::id(),
+            id
+        ))
+    }
+
+    fn read_plot(path: &Path) -> String {
+        let plot = fs::read_to_string(path).unwrap();
+        let _ = fs::remove_file(path);
+        plot
+    }
+
+    fn assert_plot_metadata_and_heatmap(plot: &str) {
+        assert!(plot.contains("# PatternLength "));
+        assert!(plot.contains("# Pattern "));
+        assert!(plot.contains("# TextLength "));
+        assert!(plot.contains("# Text "));
+        assert!(plot.contains("# Heatmap M\n"));
     }
 
     #[test]
@@ -1860,6 +2048,85 @@ mod tests {
             aligner.cigar_operations(),
             b"MMMXMMMMDMMMMMMMIMMMMMMMMMXMMMMMM"
         );
+    }
+
+    #[test]
+    fn test_write_plot_alignment_scope_contains_metadata_heatmap_and_cigar_lists() {
+        let path = temp_plot_path("alignment_scope");
+        let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
+            .with_plotting(PlotOptions::default())
+            .edit()
+            .build();
+
+        let result = aligner.align_end_to_end(PATTERN, TEXT);
+        assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
+        aligner.write_plot(&path).unwrap();
+
+        let plot = read_plot(&path);
+        assert_plot_metadata_and_heatmap(&plot);
+        assert!(plot.contains("# List CIGAR-M "));
+        assert!(plot.contains("# List CIGAR-X "));
+        assert!(plot.contains("# List CIGAR-I "));
+        assert!(plot.contains("# List CIGAR-D "));
+    }
+
+    #[test]
+    fn test_write_plot_rejects_disabled_plotting() {
+        let path = temp_plot_path("disabled");
+        let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
+            .edit()
+            .build();
+        let result = aligner.align_end_to_end(PATTERN, TEXT);
+        assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
+
+        let err = aligner.write_plot(&path).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn test_write_plot_rejects_missing_alignment_run() {
+        let path = temp_plot_path("missing_alignment");
+        let aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
+            .with_plotting(PlotOptions::default())
+            .edit()
+            .build();
+
+        let err = aligner.write_plot(&path).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn test_write_plot_score_scope_omits_cigar_lists() {
+        let path = temp_plot_path("score_scope");
+        let mut aligner = WFAligner::builder(AlignmentScope::Score, MemoryModel::MemoryHigh)
+            .with_plotting(PlotOptions::default())
+            .edit()
+            .build();
+
+        let result = aligner.align_end_to_end(PATTERN, TEXT);
+        assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
+        aligner.write_plot(&path).unwrap();
+
+        let plot = read_plot(&path);
+        assert_plot_metadata_and_heatmap(&plot);
+        assert!(!plot.contains("# List CIGAR-M "));
+    }
+
+    #[test]
+    fn test_write_plot_supports_biwfa() {
+        let path = temp_plot_path("biwfa");
+        let mut aligner =
+            WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryUltraLow)
+                .with_plotting(PlotOptions::final_alignment())
+                .affine(1, 5, 1)
+                .build();
+
+        let result = aligner.align_end_to_end(PATTERN, TEXT);
+        assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
+        aligner.write_plot(&path).unwrap();
+
+        let plot = read_plot(&path);
+        assert_plot_metadata_and_heatmap(&plot);
     }
 
     #[test]
@@ -2251,8 +2518,14 @@ mod tests {
         assert_eq!(extension_alignment_span_from_ops(b""), ((0, 0), (0, 0)));
         assert_eq!(extension_alignment_span_from_ops(b"MMM"), ((0, 3), (0, 3)));
         assert_eq!(extension_alignment_span_from_ops(b"IMMM"), ((0, 3), (0, 4)));
-        assert_eq!(extension_alignment_span_from_ops(b"MMMII"), ((0, 3), (0, 5)));
-        assert_eq!(extension_alignment_span_from_ops(b"DDMMX"), ((0, 5), (0, 3)));
+        assert_eq!(
+            extension_alignment_span_from_ops(b"MMMII"),
+            ((0, 3), (0, 5))
+        );
+        assert_eq!(
+            extension_alignment_span_from_ops(b"DDMMX"),
+            ((0, 5), (0, 3))
+        );
     }
 
     #[test]
