@@ -362,40 +362,50 @@ impl WFAlignerBuilder {
             panic!("Must set a penalty model before building the aligner");
         }
 
-        let mut aligner = WFAligner {
-            attributes: self.attributes,
-            inner: std::ptr::null_mut(),
-        };
-
-        unsafe {
-            aligner.inner = wfa2::wavefront_aligner_new(&mut aligner.attributes.inner);
-        }
+        let mut raw = WfaRawHandle::new(self.attributes);
 
         if let Some(heuristic) = self.heuristic {
-            aligner.set_heuristic(heuristic);
+            raw.set_heuristic(heuristic);
         }
 
-        aligner
+        WFAligner { raw }
     }
 }
 
-// TODO: Unify different Cigar wrappers
-/// Represents a single operation: (length, op).
-pub type CigarOp = (usize, char);
+struct CigarView<'a> {
+    score: i32,
+    begin_offset: i32,
+    end_offset: i32,
+    operations: &'a [std::os::raw::c_char],
+}
 
-pub struct WFAligner {
+impl CigarView<'_> {
+    fn active_operations(&self) -> &[std::os::raw::c_char] {
+        &self.operations[self.begin_offset as usize..self.end_offset as usize]
+    }
+}
+
+struct WfaRawHandle {
     attributes: WFAttributes,
     inner: *mut wfa2::wavefront_aligner_t,
 }
 
-impl WFAligner {
-    /// Create a builder for configuring a WFAligner
-    pub fn builder(alignment_scope: AlignmentScope, memory_model: MemoryModel) -> WFAlignerBuilder {
-        WFAlignerBuilder::new(alignment_scope, memory_model)
+impl WfaRawHandle {
+    fn new(mut attributes: WFAttributes) -> Self {
+        let inner = unsafe { wfa2::wavefront_aligner_new(&mut attributes.inner) };
+        Self { attributes, inner }
     }
 
-    pub fn get_penalties(&self) -> Penalties {
-        match DistanceMetric::from(self.attributes.inner.distance_metric) {
+    fn alignment_scope(&self) -> AlignmentScope {
+        AlignmentScope::from(self.attributes.inner.alignment_scope)
+    }
+
+    fn distance_metric(&self) -> DistanceMetric {
+        DistanceMetric::from(self.attributes.inner.distance_metric)
+    }
+
+    fn penalties(&self) -> Penalties {
+        match self.distance_metric() {
             DistanceMetric::Indel => Penalties::Indel,
             DistanceMetric::Edit => Penalties::Edit,
             DistanceMetric::GapLinear => Penalties::Linear {
@@ -420,7 +430,7 @@ impl WFAligner {
         }
     }
 
-    pub fn get_heuristics(&self) -> Heuristic {
+    fn heuristics(&self) -> Heuristic {
         let h = &self.attributes.inner.heuristic;
         match h.strategy {
             wfa2::wf_heuristic_strategy_wf_heuristic_none => Heuristic::None,
@@ -449,19 +459,7 @@ impl WFAligner {
             _ => panic!("Unknown heuristic strategy: {}", h.strategy),
         }
     }
-}
 
-impl Drop for WFAligner {
-    fn drop(&mut self) {
-        unsafe {
-            if !self.inner.is_null() {
-                wfa2::wavefront_aligner_delete(self.inner);
-            }
-        }
-    }
-}
-
-impl WFAligner {
     fn set_alignment_end_to_end(&mut self) {
         unsafe {
             wfa2::wavefront_aligner_set_alignment_end_to_end(self.inner);
@@ -486,21 +484,12 @@ impl WFAligner {
         }
     }
 
-    pub fn align_end_to_end(&mut self, pattern: &[u8], text: &[u8]) -> AlignmentStatus {
-        let status = unsafe {
-            self.set_alignment_end_to_end();
-            wfa2::wavefront_align(
-                self.inner,
-                pattern.as_ptr() as *const i8,
-                pattern.len() as i32,
-                text.as_ptr() as *const i8,
-                text.len() as i32,
-            )
-        };
-        AlignmentStatus::from(status)
+    fn align_end_to_end(&mut self, pattern: &[u8], text: &[u8]) -> i32 {
+        self.set_alignment_end_to_end();
+        self.align(pattern, text)
     }
 
-    pub fn align_ends_free(
+    fn align_ends_free(
         &mut self,
         pattern: &[u8],
         pattern_begin_free: i32,
@@ -508,14 +497,18 @@ impl WFAligner {
         text: &[u8],
         text_begin_free: i32,
         text_end_free: i32,
-    ) -> AlignmentStatus {
-        let status = unsafe {
-            self.set_alignment_ends_free(
-                pattern_begin_free,
-                pattern_end_free,
-                text_begin_free,
-                text_end_free,
-            );
+    ) -> i32 {
+        self.set_alignment_ends_free(
+            pattern_begin_free,
+            pattern_end_free,
+            text_begin_free,
+            text_end_free,
+        );
+        self.align(pattern, text)
+    }
+
+    fn align(&mut self, pattern: &[u8], text: &[u8]) -> i32 {
+        unsafe {
             wfa2::wavefront_align(
                 self.inner,
                 pattern.as_ptr() as *const i8,
@@ -523,188 +516,207 @@ impl WFAligner {
                 text.as_ptr() as *const i8,
                 text.len() as i32,
             )
-        };
-        AlignmentStatus::from(status)
-    }
-
-    pub fn score(&self) -> i32 {
-        unsafe { *(*self.inner).cigar }.score
-    }
-
-    fn cigar_score_edit_get_operations_score(operation: char, op_length: i32) -> i32 {
-        match operation {
-            'M' => 0,                     // Match has zero cost in edit distance
-            'X' | 'D' | 'I' => op_length, // Mismatch, Deletion, Insertion cost 1 each
-            _ => panic!("Invalid operation: {}", operation),
         }
     }
 
-    // Note: Indel distance (LCS) is usually about maximizing matches, not minimizing penalties.
-    // For scoring purposes, we treat it like Edit distance in a cost minimization framework
-    fn cigar_score_indel_get_operations_score(operation: char, op_length: i32) -> i32 {
-        match operation {
-            'M' => 0,                     // Match has zero cost
-            'X' | 'D' | 'I' => op_length, // Non-matches cost 1 each
-            _ => panic!("Invalid operation: {}", operation),
+    fn score(&self) -> i32 {
+        self.cigar_view()
+            .expect("CIGAR is null, alignment might have failed")
+            .score
+    }
+
+    fn clipped_operation_score(operation: char, op_length: i32, penalties: &Penalties) -> i32 {
+        match penalties {
+            Penalties::Indel | Penalties::Edit => match operation {
+                'M' => 0,
+                'X' | 'D' | 'I' => op_length,
+                _ => panic!("Invalid operation: {}", operation),
+            },
+            Penalties::Linear {
+                match_,
+                mismatch,
+                indel,
+            } => -match operation {
+                'M' => op_length * match_,
+                'X' => op_length * mismatch,
+                'D' | 'I' => op_length * indel,
+                _ => panic!("Invalid operation: {}", operation),
+            },
+            Penalties::Affine {
+                match_,
+                mismatch,
+                gap_opening,
+                gap_extension,
+            } => -match operation {
+                'M' => op_length * match_,
+                'X' => op_length * mismatch,
+                'D' | 'I' => gap_opening + gap_extension * op_length,
+                _ => panic!("Invalid operation: {}", operation),
+            },
+            Penalties::Affine2p {
+                match_,
+                mismatch,
+                gap_opening1,
+                gap_extension1,
+                gap_opening2,
+                gap_extension2,
+            } => -match operation {
+                'M' => op_length * match_,
+                'X' => op_length * mismatch,
+                'D' | 'I' => {
+                    let score1 = gap_opening1 + gap_extension1 * op_length;
+                    let score2 = gap_opening2 + gap_extension2 * op_length;
+                    std::cmp::min(score1, score2)
+                }
+                _ => panic!("Invalid operation: {}", operation),
+            },
         }
     }
 
-    fn cigar_score_gap_linear_get_operations_score(
-        operation: char,
-        op_length: i32,
-        penalties: &wfa2::linear_penalties_t,
-    ) -> i32 {
-        match operation {
-            'M' => op_length * penalties.match_,
-            'X' => op_length * penalties.mismatch,
-            'D' | 'I' => op_length * penalties.indel,
-            _ => panic!("Invalid operation: {}", operation),
-        }
-    }
-
-    fn cigar_score_gap_affine_get_operations_score(
-        operation: char,
-        op_length: i32,
-        penalties: &wfa2::affine_penalties_t,
-    ) -> i32 {
-        match operation {
-            'M' => op_length * penalties.match_,
-            'X' => op_length * penalties.mismatch,
-            'D' | 'I' => penalties.gap_opening + penalties.gap_extension * op_length,
-            _ => panic!("Invalid operation: {}", operation),
-        }
-    }
-
-    fn cigar_score_gap_affine2p_get_operations_score(
-        operation: char,
-        op_length: i32,
-        penalties: &wfa2::affine2p_penalties_t,
-    ) -> i32 {
-        match operation {
-            'M' => op_length * penalties.match_,
-            'X' => op_length * penalties.mismatch,
-            'D' | 'I' => {
-                let score1 = penalties.gap_opening1 + penalties.gap_extension1 * op_length;
-                let score2 = penalties.gap_opening2 + penalties.gap_extension2 * op_length;
-                std::cmp::min(score1, score2)
-            }
-            _ => panic!("Invalid operation: {}", operation),
-        }
-    }
-
-    pub fn cigar_score_clipped(&self, flank_len: usize) -> i32 {
-        if AlignmentScope::from(self.attributes.inner.alignment_scope) == AlignmentScope::Score {
-            panic!("Cannot clip when AlignmentScope is Score");
-        }
-
-        let cigar = unsafe { (*self.inner).cigar.as_ref() }.unwrap();
+    fn cigar_score_clipped(&self, flank_len: usize) -> i32 {
+        let cigar = self.cigar_view().unwrap();
         let begin_offset = cigar.begin_offset as isize + flank_len as isize;
-        // Ensure end_offset doesn't go below begin_offset
         let end_offset =
             std::cmp::max(begin_offset, cigar.end_offset as isize - flank_len as isize);
 
         if begin_offset >= end_offset {
-            return 0; // No operations in the clipped region
+            return 0;
         }
 
-        let operations: Vec<char> =
-            unsafe { std::slice::from_raw_parts(cigar.operations, cigar.max_operations as usize) }
-                .iter()
-                .map(|&op| op as u8 as char)
-                .collect();
-
+        let penalties = self.penalties();
         let mut score = 0;
         let mut op_length = 0;
-        // Initialize last_op with the first operation in the clipped range
-        let mut last_op: Option<char> = Some(operations[begin_offset as usize]);
+        let mut last_op: Option<char> = Some(cigar.operations[begin_offset as usize] as u8 as char);
 
         for i in begin_offset..end_offset {
-            let cur_op = operations[i as usize];
+            let cur_op = cigar.operations[i as usize] as u8 as char;
             if Some(cur_op) != last_op {
-                // Calculate score for the completed segment of the previous operation
                 if let Some(op) = last_op {
-                    match DistanceMetric::from(self.attributes.inner.distance_metric) {
-                        DistanceMetric::Indel => {
-                            // Add cost for Indel (positive value)
-                            score += Self::cigar_score_indel_get_operations_score(op, op_length);
-                        }
-                        DistanceMetric::Edit => {
-                            // Add cost for Edit (positive value)
-                            score += Self::cigar_score_edit_get_operations_score(op, op_length);
-                        }
-                        DistanceMetric::GapLinear => {
-                            // Subtract penalty for gap-linear (negative value)
-                            score -= Self::cigar_score_gap_linear_get_operations_score(
-                                op,
-                                op_length,
-                                &self.attributes.inner.linear_penalties,
-                            );
-                        }
-                        DistanceMetric::GapAffine => {
-                            // Subtract penalty for gap-affine (negative value)
-                            score -= Self::cigar_score_gap_affine_get_operations_score(
-                                op,
-                                op_length,
-                                &self.attributes.inner.affine_penalties,
-                            );
-                        }
-                        DistanceMetric::GapAffine2p => {
-                            // Subtract penalty for gap-affine-2p (negative value)
-                            score -= Self::cigar_score_gap_affine2p_get_operations_score(
-                                op,
-                                op_length,
-                                &self.attributes.inner.affine2p_penalties,
-                            );
-                        }
-                    };
+                    score += Self::clipped_operation_score(op, op_length, &penalties);
                 }
-                op_length = 0; // Reset length for the new operation
+                op_length = 0;
             }
             last_op = Some(cur_op);
             op_length += 1;
         }
 
-        // Add score for the last segment
         if let Some(op) = last_op {
-            match DistanceMetric::from(self.attributes.inner.distance_metric) {
-                DistanceMetric::Indel => {
-                    // Add cost for Indel (positive value)
-                    score += Self::cigar_score_indel_get_operations_score(op, op_length);
-                }
-                DistanceMetric::Edit => {
-                    // Add cost for Edit (positive value)
-                    score += Self::cigar_score_edit_get_operations_score(op, op_length);
-                }
-                DistanceMetric::GapLinear => {
-                    // Subtract penalty for gap-linear (negative value)
-                    score -= Self::cigar_score_gap_linear_get_operations_score(
-                        op,
-                        op_length,
-                        &self.attributes.inner.linear_penalties,
-                    );
-                }
-                DistanceMetric::GapAffine => {
-                    // Subtract penalty for gap-affine (negative value)
-                    score -= Self::cigar_score_gap_affine_get_operations_score(
-                        op,
-                        op_length,
-                        &self.attributes.inner.affine_penalties,
-                    );
-                }
-                DistanceMetric::GapAffine2p => {
-                    // Subtract penalty for gap-affine-2p (negative value)
-                    score -= Self::cigar_score_gap_affine2p_get_operations_score(
-                        op,
-                        op_length,
-                        &self.attributes.inner.affine2p_penalties,
-                    );
-                }
-            };
+            score += Self::clipped_operation_score(op, op_length, &penalties);
         }
         score
     }
 
-    pub fn set_heuristic(&mut self, heuristic: Heuristic) {
+    fn cigar_ptr(&self) -> *mut wfa2::cigar_t {
+        if self.inner.is_null() {
+            std::ptr::null_mut()
+        } else {
+            unsafe { (*self.inner).cigar }
+        }
+    }
+
+    fn cigar_view(&self) -> Option<CigarView<'_>> {
+        let cigar = unsafe { self.cigar_ptr().as_ref() }?;
+        let operations = if cigar.operations.is_null() || cigar.max_operations <= 0 {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(cigar.operations, cigar.max_operations as usize) }
+        };
+        Some(CigarView {
+            score: cigar.score,
+            begin_offset: cigar.begin_offset,
+            end_offset: cigar.end_offset,
+            operations,
+        })
+    }
+
+    fn active_cigar_bytes(&self) -> Option<&[u8]> {
+        let cigar = unsafe { self.cigar_ptr().as_ref() }?;
+        if cigar.operations.is_null() || cigar.begin_offset > cigar.end_offset {
+            return Some(&[]);
+        }
+
+        let cigar_length = (cigar.end_offset - cigar.begin_offset) as usize;
+        let cigar_operations =
+            unsafe { cigar.operations.offset(cigar.begin_offset as isize) as *const u8 };
+        Some(unsafe { std::slice::from_raw_parts(cigar_operations, cigar_length) })
+    }
+
+    fn sequence_lengths(&self) -> (usize, usize) {
+        if self.inner.is_null() {
+            panic!("Internal aligner pointer is null");
+        }
+        unsafe {
+            (
+                (*self.inner).sequences.pattern_length as usize,
+                (*self.inner).sequences.text_length as usize,
+            )
+        }
+    }
+
+    fn is_global_alignment(&self) -> bool {
+        if self.inner.is_null() {
+            panic!("Internal aligner pointer is null");
+        }
+        unsafe { (*self.inner).alignment_form.span == wfa2::alignment_span_t_alignment_end2end }
+    }
+
+    fn sam_cigar(&self, show_mismatches: bool) -> Vec<u32> {
+        if self.inner.is_null() {
+            panic!("Internal aligner pointer is null");
+        }
+
+        unsafe {
+            let mut sam_cigar_buffer_ptr: *mut u32 = std::ptr::null_mut();
+            let mut sam_cigar_length: i32 = 0;
+
+            wfa2::cigar_get_CIGAR(
+                self.cigar_ptr(),
+                show_mismatches,
+                &mut sam_cigar_buffer_ptr,
+                &mut sam_cigar_length,
+            );
+
+            if !sam_cigar_buffer_ptr.is_null() && sam_cigar_length > 0 {
+                let cigar_buffer_slice =
+                    std::slice::from_raw_parts(sam_cigar_buffer_ptr, sam_cigar_length as usize);
+                cigar_buffer_slice.to_vec()
+            } else {
+                Vec::new()
+            }
+        }
+    }
+
+    fn count_matches(&self) -> i32 {
+        if self.inner.is_null() {
+            panic!("Internal aligner pointer is null");
+        }
+        let cigar_ptr = self.cigar_ptr();
+        if cigar_ptr.is_null() {
+            panic!("CIGAR pointer is null, cannot count matches.");
+        }
+        unsafe { wfa2::cigar_count_matches(cigar_ptr) }
+    }
+
+    fn cigar_score(&mut self) -> i32 {
+        let metric = self.distance_metric();
+        let cigar = self.cigar_ptr();
+        unsafe {
+            match metric {
+                DistanceMetric::Indel | DistanceMetric::Edit => wfa2::cigar_score_edit(cigar),
+                DistanceMetric::GapLinear => {
+                    wfa2::cigar_score_gap_linear(cigar, &self.attributes.inner.linear_penalties)
+                }
+                DistanceMetric::GapAffine => {
+                    wfa2::cigar_score_gap_affine(cigar, &self.attributes.inner.affine_penalties)
+                }
+                DistanceMetric::GapAffine2p => {
+                    wfa2::cigar_score_gap_affine2p(cigar, &self.attributes.inner.affine2p_penalties)
+                }
+            }
+        }
+    }
+
+    fn set_heuristic(&mut self, heuristic: Heuristic) {
         match heuristic {
             Heuristic::None => {
                 self.attributes.inner.heuristic.strategy =
@@ -778,32 +790,100 @@ impl WFAligner {
             }
         }
     }
+}
+
+impl Drop for WfaRawHandle {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.inner.is_null() {
+                wfa2::wavefront_aligner_delete(self.inner);
+            }
+        }
+    }
+}
+
+// TODO: Unify different Cigar wrappers
+/// Represents a single operation: (length, op).
+pub type CigarOp = (usize, char);
+
+pub struct WFAligner {
+    raw: WfaRawHandle,
+}
+
+impl WFAligner {
+    /// Create a builder for configuring a WFAligner
+    pub fn builder(alignment_scope: AlignmentScope, memory_model: MemoryModel) -> WFAlignerBuilder {
+        WFAlignerBuilder::new(alignment_scope, memory_model)
+    }
+
+    pub fn get_penalties(&self) -> Penalties {
+        self.raw.penalties()
+    }
+
+    pub fn get_heuristics(&self) -> Heuristic {
+        self.raw.heuristics()
+    }
+}
+
+impl WFAligner {
+    pub fn align_end_to_end(&mut self, pattern: &[u8], text: &[u8]) -> AlignmentStatus {
+        let status = self.raw.align_end_to_end(pattern, text);
+        AlignmentStatus::from(status)
+    }
+
+    pub fn align_ends_free(
+        &mut self,
+        pattern: &[u8],
+        pattern_begin_free: i32,
+        pattern_end_free: i32,
+        text: &[u8],
+        text_begin_free: i32,
+        text_end_free: i32,
+    ) -> AlignmentStatus {
+        let status = self.raw.align_ends_free(
+            pattern,
+            pattern_begin_free,
+            pattern_end_free,
+            text,
+            text_begin_free,
+            text_end_free,
+        );
+        AlignmentStatus::from(status)
+    }
+
+    pub fn score(&self) -> i32 {
+        self.raw.score()
+    }
+
+    pub fn cigar_score_clipped(&self, flank_len: usize) -> i32 {
+        if self.raw.alignment_scope() == AlignmentScope::Score {
+            panic!("Cannot clip when AlignmentScope is Score");
+        }
+        self.raw.cigar_score_clipped(flank_len)
+    }
+
+    pub fn set_heuristic(&mut self, heuristic: Heuristic) {
+        self.raw.set_heuristic(heuristic);
+    }
 
     // TODO: Refactor
     // TODO: THIS DOES NOT WORK WITH BIWFA
     pub fn get_alignment(&self) -> WfaAlign {
-        let cigar = unsafe { (*self.inner).cigar.as_ref() }.unwrap();
-        let raw_operations =
-            unsafe { std::slice::from_raw_parts(cigar.operations, cigar.max_operations as usize) };
-
-        let begin = cigar.begin_offset as usize;
-        let end = cigar.end_offset as usize;
+        let cigar = self.raw.cigar_view().unwrap();
+        let raw_operations = cigar.active_operations();
 
         let mut operations = Vec::with_capacity(raw_operations.len());
-        for op in &raw_operations[begin..end] {
+        for op in raw_operations {
             let operation = WfaOp::from_u8(*op as u8);
             operations.push(operation);
         }
 
-        let pattern_len = unsafe { (*self.inner).sequences.pattern_length } as usize;
-        let text_len = unsafe { (*self.inner).sequences.text_length } as usize;
+        let (pattern_len, text_len) = self.raw.sequence_lengths();
 
         let (xstart, xend, ystart, yend);
 
         // Check if alignment was end-to-end
-        let is_global = unsafe {
-            (*self.inner).alignment_form.span == wfa2::alignment_span_t_alignment_end2end
-        };
+        let is_global = self.raw.is_global_alignment();
         // For global alignment, span is always the full sequence lengths
         if is_global {
             xstart = 0;
@@ -863,29 +943,21 @@ impl WFAligner {
     // TODO: THIS DOES NOT WORK WITH BIWFA
     pub fn get_alignment_span(&self) -> ((usize, usize), (usize, usize)) {
         // Check if alignment was end-to-end
-        let is_global = unsafe {
-            (*self.inner).alignment_form.span == wfa2::alignment_span_t_alignment_end2end
-        };
+        let is_global = self.raw.is_global_alignment();
 
         if is_global {
-            let pattern_len = unsafe { (*self.inner).sequences.pattern_length } as usize;
-            let text_len = unsafe { (*self.inner).sequences.text_length } as usize;
+            let (pattern_len, text_len) = self.raw.sequence_lengths();
             ((0, pattern_len), (0, text_len))
         } else {
-            let cigar = unsafe { (*self.inner).cigar.as_ref() }.unwrap();
-            let raw_operations = unsafe {
-                std::slice::from_raw_parts(cigar.operations, cigar.max_operations as usize)
-            };
-
-            let begin = cigar.begin_offset as usize;
-            let end = cigar.end_offset as usize;
+            let cigar = self.raw.cigar_view().unwrap();
+            let raw_operations = cigar.active_operations();
 
             let mut pattern_index = 0;
             let mut text_index = 0;
             let mut is_span_started = false;
             let (mut pattern_start, mut pattern_end, mut text_start, mut text_end) = (0, 0, 0, 0);
 
-            for &op in &raw_operations[begin..end] {
+            for &op in raw_operations {
                 match op as u8 {
                     b'I' => text_index += 1,
                     b'D' => pattern_index += 1,
@@ -908,54 +980,23 @@ impl WFAligner {
     }
 
     pub fn cigar_operations(&self) -> Vec<u8> {
-        if AlignmentScope::from(self.attributes.inner.alignment_scope) == AlignmentScope::Score {
+        if self.raw.alignment_scope() == AlignmentScope::Score {
             return Vec::new();
         }
 
-        let cigar = unsafe { (*self.inner).cigar.as_ref() }
+        let cigar_str = self
+            .raw
+            .active_cigar_bytes()
             .expect("CIGAR is null, alignment might have failed or scope was Score");
-
-        if cigar.operations.is_null() || cigar.begin_offset > cigar.end_offset {
-            return Vec::new();
-        }
-
-        let cigar_str = unsafe {
-            let begin_offset = cigar.begin_offset;
-            let cigar_operations = cigar.operations.offset(begin_offset as isize) as *const u8;
-            let cigar_length = (cigar.end_offset - begin_offset) as usize;
-            std::slice::from_raw_parts(cigar_operations, cigar_length)
-        };
         cigar_str.to_vec()
     }
 
     // TODO: Possibly remove safety checks?
     pub fn get_sam_cigar(&self, show_mismatches: bool) -> Vec<u32> {
-        if AlignmentScope::from(self.attributes.inner.alignment_scope) == AlignmentScope::Score {
+        if self.raw.alignment_scope() == AlignmentScope::Score {
             panic!("Cannot get SAM CIGAR when AlignmentScope is Score");
         }
-        if self.inner.is_null() {
-            panic!("Internal aligner pointer is null");
-        }
-
-        unsafe {
-            let mut sam_cigar_buffer_ptr: *mut u32 = std::ptr::null_mut();
-            let mut sam_cigar_length: i32 = 0;
-
-            wfa2::cigar_get_CIGAR(
-                (*self.inner).cigar,
-                show_mismatches,
-                &mut sam_cigar_buffer_ptr,
-                &mut sam_cigar_length,
-            );
-
-            if !sam_cigar_buffer_ptr.is_null() && sam_cigar_length > 0 {
-                let cigar_buffer_slice =
-                    std::slice::from_raw_parts(sam_cigar_buffer_ptr, sam_cigar_length as usize);
-                cigar_buffer_slice.to_vec()
-            } else {
-                Vec::new()
-            }
-        }
+        self.raw.sam_cigar(show_mismatches)
     }
 
     pub fn decode_sam_cigar(sam_cigar_buffer: &[u32]) -> Vec<CigarOp> {
@@ -986,43 +1027,17 @@ impl WFAligner {
     /// Counts the number of match ('M') operations in the CIGAR string.
     // TODO: Possibly remove safety checks?
     pub fn count_matches(&self) -> i32 {
-        if AlignmentScope::from(self.attributes.inner.alignment_scope) == AlignmentScope::Score {
+        if self.raw.alignment_scope() == AlignmentScope::Score {
             panic!("Cannot count matches when AlignmentScope is Score");
         }
-        if self.inner.is_null() {
-            panic!("Internal aligner pointer is null");
-        }
-        let cigar_ptr = unsafe { (*self.inner).cigar };
-        if cigar_ptr.is_null() {
-            panic!("CIGAR pointer is null, cannot count matches.");
-        }
-        unsafe { wfa2::cigar_count_matches(cigar_ptr) }
+        self.raw.count_matches()
     }
 
     pub fn cigar_score(&mut self) -> i32 {
-        if AlignmentScope::from(self.attributes.inner.alignment_scope) == AlignmentScope::Score {
+        if self.raw.alignment_scope() == AlignmentScope::Score {
             panic!("Cannot calculate CIGAR score when AlignmentScope is Score");
         }
-
-        unsafe {
-            match DistanceMetric::from(self.attributes.inner.distance_metric) {
-                DistanceMetric::Indel | DistanceMetric::Edit => {
-                    wfa2::cigar_score_edit((*self.inner).cigar)
-                }
-                DistanceMetric::GapLinear => wfa2::cigar_score_gap_linear(
-                    (*self.inner).cigar,
-                    &mut self.attributes.inner.linear_penalties,
-                ),
-                DistanceMetric::GapAffine => wfa2::cigar_score_gap_affine(
-                    (*self.inner).cigar,
-                    &mut self.attributes.inner.affine_penalties,
-                ),
-                DistanceMetric::GapAffine2p => wfa2::cigar_score_gap_affine2p(
-                    (*self.inner).cigar,
-                    &mut self.attributes.inner.affine2p_penalties,
-                ),
-            }
-        }
+        self.raw.cigar_score()
     }
 
     #[allow(dead_code)]
@@ -1030,7 +1045,7 @@ impl WFAligner {
         let offset = flank_len.unwrap_or(0);
         let mut cstr = String::new();
 
-        let cigar = unsafe { (*self.inner).cigar.as_ref() }.unwrap();
+        let cigar = self.raw.cigar_view().unwrap();
 
         let begin_offset = cigar.begin_offset as usize + offset;
         let end_offset = cigar.end_offset as usize - offset;
@@ -1039,8 +1054,7 @@ impl WFAligner {
             return cstr;
         }
 
-        let operations =
-            unsafe { std::slice::from_raw_parts(cigar.operations, cigar.max_operations as usize) };
+        let operations = cigar.operations;
         let mut last_op = operations[begin_offset];
         let mut last_op_length = 1;
 
@@ -1081,9 +1095,8 @@ impl WFAligner {
         let mut ops_alg = String::new();
         let mut text_alg = String::new();
 
-        let cigar = unsafe { (*self.inner).cigar.as_ref() }.unwrap();
-        let operations =
-            unsafe { std::slice::from_raw_parts(cigar.operations, cigar.max_operations as usize) };
+        let cigar = self.raw.cigar_view().unwrap();
+        let operations = cigar.operations;
 
         let begin_offset = cigar.begin_offset as isize + offset as isize;
         let end_offset = cigar.end_offset as isize - offset as isize;
