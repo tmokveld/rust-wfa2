@@ -52,8 +52,8 @@ let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::Mem
 
 let pattern = b"TCTTTACTCGCGCGTTGGAGAAATACAATAGT";
 let text = b"TCTATACTGCGCGTTTGGAGAAATAAAATAGT";
-let status = aligner.align_end_to_end(pattern, text);
-assert_eq!(status, AlignmentStatus::StatusAlgCompleted);
+let result = aligner.align_end_to_end(pattern, text);
+assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
 assert_eq!(aligner.score(), -24);
 assert_eq!(
     aligner.cigar_operations(),

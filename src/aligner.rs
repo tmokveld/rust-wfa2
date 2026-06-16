@@ -329,7 +329,7 @@ impl From<u32> for DistanceMetric {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AlignmentStatus {
     // OK Status (>=0)
     StatusAlgCompleted = wfa2::WF_STATUS_ALG_COMPLETED as isize,
@@ -338,6 +338,24 @@ pub enum AlignmentStatus {
     StatusMaxStepsReached = wfa2::WF_STATUS_MAX_STEPS_REACHED as isize,
     StatusOOM = wfa2::WF_STATUS_OOM as isize,
     StatusUnattainable = wfa2::WF_STATUS_UNATTAINABLE as isize,
+}
+
+/// Allocation-free snapshot of WFA2's alignment status after an alignment run.
+///
+/// `score` is WFA2's status/current wavefront score. It can differ from
+/// `WFAligner::score()`, which reads the final CIGAR score when one is
+/// available. `memory_used` is the current memory usage reported by WFA2 in
+/// bytes, not a peak-memory measurement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AlignmentResult {
+    pub status: AlignmentStatus,
+    pub score: i32,
+    /// Whether WFA2 reports that the alignment was heuristically dropped.
+    pub dropped: bool,
+    /// Number of contiguous null wavefront steps reported by WFA2.
+    pub null_steps: i32,
+    /// Current memory usage reported by WFA2, in bytes.
+    pub memory_used: u64,
 }
 
 impl fmt::Display for AlignmentStatus {
@@ -967,7 +985,7 @@ impl WfaRawHandle {
         }
     }
 
-    fn align_end_to_end(&mut self, pattern: &[u8], text: &[u8]) -> i32 {
+    fn align_end_to_end(&mut self, pattern: &[u8], text: &[u8]) -> AlignmentResult {
         self.set_alignment_end_to_end();
         self.align(pattern, text)
     }
@@ -980,7 +998,7 @@ impl WfaRawHandle {
         text: &[u8],
         text_begin_free: i32,
         text_end_free: i32,
-    ) -> i32 {
+    ) -> AlignmentResult {
         self.set_alignment_ends_free(
             pattern_begin_free,
             pattern_end_free,
@@ -990,7 +1008,7 @@ impl WfaRawHandle {
         self.align(pattern, text)
     }
 
-    fn align_extension(&mut self, pattern: &[u8], text: &[u8]) -> i32 {
+    fn align_extension(&mut self, pattern: &[u8], text: &[u8]) -> AlignmentResult {
         if self.memory_model() == MemoryModel::MemoryUltraLow {
             panic!("Extension alignment is not supported with MemoryUltraLow");
         }
@@ -999,8 +1017,8 @@ impl WfaRawHandle {
         self.align(pattern, text)
     }
 
-    fn align(&mut self, pattern: &[u8], text: &[u8]) -> i32 {
-        unsafe {
+    fn align(&mut self, pattern: &[u8], text: &[u8]) -> AlignmentResult {
+        let raw_status = unsafe {
             wfa2::wavefront_align(
                 self.inner,
                 pattern.as_ptr() as *const i8,
@@ -1008,6 +1026,24 @@ impl WfaRawHandle {
                 text.as_ptr() as *const i8,
                 text.len() as i32,
             )
+        };
+        let result = self.alignment_result();
+        debug_assert_eq!(result.status, AlignmentStatus::from(raw_status));
+        result
+    }
+
+    fn alignment_result(&self) -> AlignmentResult {
+        if self.inner.is_null() {
+            panic!("Internal aligner pointer is null");
+        }
+
+        let status = unsafe { &(*self.inner).align_status };
+        AlignmentResult {
+            status: AlignmentStatus::from(status.status),
+            score: status.score,
+            dropped: status.dropped,
+            null_steps: status.num_null_steps,
+            memory_used: status.memory_used,
         }
     }
 
@@ -1396,9 +1432,8 @@ impl WFAligner {
 }
 
 impl WFAligner {
-    pub fn align_end_to_end(&mut self, pattern: &[u8], text: &[u8]) -> AlignmentStatus {
-        let status = self.raw.align_end_to_end(pattern, text);
-        AlignmentStatus::from(status)
+    pub fn align_end_to_end(&mut self, pattern: &[u8], text: &[u8]) -> AlignmentResult {
+        self.raw.align_end_to_end(pattern, text)
     }
 
     pub fn align_ends_free(
@@ -1409,16 +1444,15 @@ impl WFAligner {
         text: &[u8],
         text_begin_free: i32,
         text_end_free: i32,
-    ) -> AlignmentStatus {
-        let status = self.raw.align_ends_free(
+    ) -> AlignmentResult {
+        self.raw.align_ends_free(
             pattern,
             pattern_begin_free,
             pattern_end_free,
             text,
             text_begin_free,
             text_end_free,
-        );
-        AlignmentStatus::from(status)
+        )
     }
 
     /// Align a right extension using WFA2's extension mode.
@@ -1427,9 +1461,8 @@ impl WFAligner {
     /// maximal-scoring extension and can return `StatusAlgPartial`.
     /// `MemoryUltraLow` is rejected because WFA2's BiWFA path exits the process
     /// for extension alignments.
-    pub fn align_extension(&mut self, pattern: &[u8], text: &[u8]) -> AlignmentStatus {
-        let status = self.raw.align_extension(pattern, text);
-        AlignmentStatus::from(status)
+    pub fn align_extension(&mut self, pattern: &[u8], text: &[u8]) -> AlignmentResult {
+        self.raw.align_extension(pattern, text)
     }
 
     pub fn score(&self) -> i32 {
@@ -1694,8 +1727,12 @@ mod tests {
         let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
             .indel()
             .build();
-        let status = aligner.align_end_to_end(PATTERN, TEXT);
-        assert_eq!(status, AlignmentStatus::StatusAlgCompleted);
+        let result = aligner.align_end_to_end(PATTERN, TEXT);
+        assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
+        assert_eq!(result.score, 10);
+        assert!(!result.dropped);
+        assert!(result.null_steps >= 0);
+        assert!(result.memory_used > 0);
         assert_eq!(aligner.score(), 10);
         assert_eq!(aligner.cigar_string(None), "1M1I1D3M1I5M2I2D8M1I1M1I1M1I9M");
         let (a, b, c) = aligner.matching(PATTERN, TEXT, None);
@@ -1710,8 +1747,8 @@ mod tests {
         let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
             .edit()
             .build();
-        let status = aligner.align_end_to_end(PATTERN, TEXT);
-        assert_eq!(status, AlignmentStatus::StatusAlgCompleted);
+        let result = aligner.align_end_to_end(PATTERN, TEXT);
+        assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
         assert_eq!(aligner.score(), 7);
         assert_eq!(aligner.cigar_string(None), "1M1X3M1I5M2X8M1I1M1I1M1I9M");
         let (a, b, c) = aligner.matching(PATTERN, TEXT, None);
@@ -1726,8 +1763,8 @@ mod tests {
         let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
             .linear(6, 2)
             .build();
-        let status = aligner.align_end_to_end(PATTERN, TEXT);
-        assert_eq!(status, AlignmentStatus::StatusAlgCompleted);
+        let result = aligner.align_end_to_end(PATTERN, TEXT);
+        assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
         assert_eq!(aligner.score(), -20);
         assert_eq!(aligner.cigar_string(None), "1M1I1D3M1I5M2I2D8M1I1M1I1M1I9M");
         let (a, b, c) = aligner.matching(PATTERN, TEXT, None);
@@ -1742,8 +1779,8 @@ mod tests {
         let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryLow)
             .affine(6, 4, 2)
             .build();
-        let status = aligner.align_end_to_end(PATTERN, TEXT);
-        assert_eq!(status, AlignmentStatus::StatusAlgCompleted);
+        let result = aligner.align_end_to_end(PATTERN, TEXT);
+        assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
         assert_eq!(aligner.score(), -40);
         assert_eq!(aligner.cigar_string(None), "1M1X3M1I5M2X8M3I1M1X9M");
         let (a, b, c) = aligner.matching(PATTERN, TEXT, None);
@@ -1761,8 +1798,8 @@ mod tests {
 
         let pattern = b"TCTTTACTCGCGCGTTGGAGAAATACAATAGT";
         let text = b"TCTATACTGCGCGTTTGGAGAAATAAAATAGT";
-        let status = aligner.align_end_to_end(pattern, text);
-        assert_eq!(status, AlignmentStatus::StatusAlgCompleted);
+        let result = aligner.align_end_to_end(pattern, text);
+        assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
         assert_eq!(aligner.score(), -24);
         assert_eq!(
             aligner.cigar_operations(),
@@ -1778,8 +1815,8 @@ mod tests {
 
         let pattern = b"ATAATA";
         let text = b"ATACATAAAATA";
-        let status = aligner.align_end_to_end(pattern, text);
-        assert_eq!(status, AlignmentStatus::StatusAlgCompleted);
+        let result = aligner.align_end_to_end(pattern, text);
+        assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
         assert_eq!(aligner.score(), -2);
         assert_eq!(raw_cigar_string(&aligner), "MMMIIIIIIMMM");
     }
@@ -1789,8 +1826,8 @@ mod tests {
         let mut aligner = WFAligner::builder(AlignmentScope::Score, MemoryModel::MemoryLow)
             .affine(6, 4, 2)
             .build();
-        let status = aligner.align_end_to_end(PATTERN, TEXT);
-        assert_eq!(status, AlignmentStatus::StatusAlgCompleted);
+        let result = aligner.align_end_to_end(PATTERN, TEXT);
+        assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
         assert_eq!(aligner.score(), -40);
         assert_eq!(aligner.cigar_string(None), "");
         let (a, b, c) = aligner.matching(PATTERN, TEXT, None);
@@ -1802,8 +1839,8 @@ mod tests {
         let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
             .affine2p(6, 2, 2, 4, 1)
             .build();
-        let status = aligner.align_end_to_end(PATTERN, TEXT);
-        assert_eq!(status, AlignmentStatus::StatusAlgCompleted);
+        let result = aligner.align_end_to_end(PATTERN, TEXT);
+        assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
         assert_eq!(aligner.score(), -34);
         assert_eq!(aligner.cigar_string(None), "1M1X3M1I5M2X8M1I1M1I1M1I9M");
         let (a, b, c) = aligner.matching(PATTERN, TEXT, None);
@@ -1821,8 +1858,8 @@ mod tests {
 
         let pattern = b"TCTATAATAGT";
         let text = b"TCTATACTGCGCGTTTGGAGAAATAAAATAGT";
-        let status = aligner.align_end_to_end(pattern, text);
-        assert_eq!(status, AlignmentStatus::StatusAlgCompleted);
+        let result = aligner.align_end_to_end(pattern, text);
+        assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
         assert_eq!(aligner.score(), 1);
         assert_eq!(aligner.cigar_string(None), "6M21I5M");
     }
@@ -1835,8 +1872,8 @@ mod tests {
 
         let pattern = b"TCTATAATAGT";
         let text = b"TCTATACTGCGCGTTTGGAGAAATAAAATAGT";
-        let status = aligner.align_end_to_end(pattern, text);
-        assert_eq!(status, AlignmentStatus::StatusAlgCompleted);
+        let result = aligner.align_end_to_end(pattern, text);
+        assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
         assert_eq!(aligner.score(), -73);
         assert_eq!(
             raw_cigar_string(&aligner),
@@ -1853,16 +1890,16 @@ mod tests {
             WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryLow)
                 .affine_with_match(-1, 2, 0, 1)
                 .build();
-        let status = affine_aligner.align_end_to_end(pattern, text);
-        assert_eq!(status, AlignmentStatus::StatusAlgCompleted);
+        let result = affine_aligner.align_end_to_end(pattern, text);
+        assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
         assert_eq!(affine_aligner.score(), 0);
 
         let mut linear_aligner =
             WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryLow)
                 .linear_with_match(-1, 2, 1)
                 .build();
-        let status = linear_aligner.align_end_to_end(pattern, text);
-        assert_eq!(status, AlignmentStatus::StatusAlgCompleted);
+        let result = linear_aligner.align_end_to_end(pattern, text);
+        assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
         assert_eq!(linear_aligner.score(), 0);
     }
 
@@ -1873,8 +1910,8 @@ mod tests {
         let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
             .affine2p(8, 4, 2, 24, 1)
             .build();
-        let status = aligner.align_ends_free(pattern, 0, 0, text, 0, text.len() as i32);
-        assert_eq!(status, AlignmentStatus::StatusAlgCompleted);
+        let result = aligner.align_ends_free(pattern, 0, 0, text, 0, text.len() as i32);
+        assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
         let ((xstart, xend), (ystart, yend)) = aligner.get_alignment_span();
         assert_eq!(ystart, 13);
         assert_eq!(yend, 35);
@@ -1890,8 +1927,8 @@ mod tests {
             .affine2p(8, 4, 2, 24, 1)
             .with_heuristics(Heuristics::none())
             .build();
-        let status = aligner.align_ends_free(pattern, 0, 0, text, 0, text.len() as i32);
-        assert_eq!(status, AlignmentStatus::StatusAlgCompleted);
+        let result = aligner.align_ends_free(pattern, 0, 0, text, 0, text.len() as i32);
+        assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
         let ((xstart, xend), (ystart, yend)) = aligner.get_alignment_span();
 
         assert_eq!(ystart, 0);
@@ -1907,8 +1944,8 @@ mod tests {
         let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
             .affine(6, 4, 2)
             .build();
-        let status = aligner.align_ends_free(pattern, 0, 0, text, 0, text.len() as i32);
-        assert_eq!(status, AlignmentStatus::StatusAlgCompleted);
+        let result = aligner.align_ends_free(pattern, 0, 0, text, 0, text.len() as i32);
+        assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
         assert_eq!(aligner.score(), -36);
         assert_eq!(aligner.cigar_string(None), "13I9M1X12M15I");
         let (a, b, c) = aligner.matching(pattern, text, None);
@@ -1928,7 +1965,7 @@ mod tests {
         let text = b"TCTATACTGCGCGTTTGGAGAAATAAAATAGT";
         let pattern_size = pattern.len() as i32;
         let text_size = text.len() as i32;
-        let status = aligner.align_ends_free(
+        let result = aligner.align_ends_free(
             pattern,
             pattern_size,
             pattern_size,
@@ -1936,7 +1973,7 @@ mod tests {
             text_size,
             text_size,
         );
-        assert_eq!(status, AlignmentStatus::StatusAlgCompleted);
+        assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
         assert_eq!(aligner.score(), 13);
         assert_eq!(aligner.cigar_string(None), "9I13M10I");
 
@@ -1944,7 +1981,7 @@ mod tests {
         let text = b"CGCGTTTGGAGAA";
         let pattern_size = pattern.len() as i32;
         let text_size = text.len() as i32;
-        let status = aligner.align_ends_free(
+        let result = aligner.align_ends_free(
             pattern,
             pattern_size,
             pattern_size,
@@ -1952,7 +1989,7 @@ mod tests {
             text_size,
             text_size,
         );
-        assert_eq!(status, AlignmentStatus::StatusAlgCompleted);
+        assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
         assert_eq!(aligner.score(), 13);
         assert_eq!(aligner.cigar_string(None), "9D13M10D");
     }
@@ -1967,7 +2004,7 @@ mod tests {
         let text = b"TCTATATTTTTTTTTGGAGAAATAAAATAGT";
         let pattern_size = pattern.len() as i32;
         let text_size = text.len() as i32;
-        let status = aligner.align_ends_free(
+        let result = aligner.align_ends_free(
             pattern,
             pattern_size,
             pattern_size,
@@ -1975,7 +2012,7 @@ mod tests {
             text_size,
             text_size,
         );
-        assert_eq!(status, AlignmentStatus::StatusAlgCompleted);
+        assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
         assert_eq!(
             raw_cigar_string(&aligner),
             "IIMMMMMMMMMMMMIMMMMMMMMMMMMMMII"
@@ -1989,9 +2026,9 @@ mod tests {
         let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
             .affine(6, 4, 2)
             .build();
-        let status =
+        let result =
             aligner.align_ends_free(pattern, 0, pattern.len() as i32, text, 0, text.len() as i32);
-        assert_eq!(status, AlignmentStatus::StatusAlgCompleted);
+        assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
         assert_eq!(aligner.score(), -24);
         assert_eq!(aligner.cigar_string(None), "5M1X6M1I11M4D1M15I");
         let (a, b, c) = aligner.matching(pattern, text, None);
@@ -2010,7 +2047,7 @@ mod tests {
             WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
                 .affine(6, 4, 2)
                 .build();
-        let ends_free_status = ends_free_aligner.align_ends_free(
+        let ends_free_result = ends_free_aligner.align_ends_free(
             pattern,
             0,
             pattern.len() as i32,
@@ -2018,7 +2055,7 @@ mod tests {
             0,
             text.len() as i32,
         );
-        assert_eq!(ends_free_status, AlignmentStatus::StatusAlgCompleted);
+        assert_eq!(ends_free_result.status, AlignmentStatus::StatusAlgCompleted);
         assert_eq!(ends_free_aligner.score(), -24);
         assert_eq!(ends_free_aligner.cigar_string(None), "5M1X6M1I11M4D1M15I");
 
@@ -2026,8 +2063,8 @@ mod tests {
             WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
                 .affine(6, 4, 2)
                 .build();
-        let extension_status = extension_aligner.align_extension(pattern, text);
-        assert_eq!(extension_status, AlignmentStatus::StatusAlgPartial);
+        let extension_result = extension_aligner.align_extension(pattern, text);
+        assert_eq!(extension_result.status, AlignmentStatus::StatusAlgPartial);
         assert_eq!(extension_aligner.score(), 10);
         assert_eq!(extension_aligner.cigar_string(None), "5M1X6M1I11M");
         assert_eq!(extension_aligner.cigar_score(), -12);
@@ -2052,8 +2089,8 @@ mod tests {
             .affine(6, 4, 2)
             .build();
 
-        let status = aligner.align_extension(pattern, text);
-        assert_eq!(status, AlignmentStatus::StatusAlgCompleted);
+        let result = aligner.align_extension(pattern, text);
+        assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
         assert_eq!(aligner.score(), -24);
     }
 
@@ -2075,8 +2112,8 @@ mod tests {
         let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
             .affine(6, 4, 2)
             .build();
-        let status = aligner.align_ends_free(pattern, 0, 0, text, 0, 0);
-        assert_eq!(status, AlignmentStatus::StatusAlgCompleted);
+        let result = aligner.align_ends_free(pattern, 0, 0, text, 0, 0);
+        assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
         assert_eq!(aligner.score(), -48);
         assert_eq!(aligner.cigar_string(None), "16I12M1I6M1X4M");
         let (a, b, c) = aligner.matching(pattern, text, None);
@@ -2093,8 +2130,8 @@ mod tests {
         let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
             .affine(6, 4, 2)
             .build();
-        let status = aligner.align_ends_free(pattern, 0, 0, text, 0, 0);
-        assert_eq!(status, AlignmentStatus::StatusAlgCompleted);
+        let result = aligner.align_ends_free(pattern, 0, 0, text, 0, 0);
+        assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
         assert_eq!(aligner.score(), -92);
         assert_eq!(aligner.cigar_string(None), "19D9M1X4M1X5M17I");
         let (a, b, c) = aligner.matching(pattern, text, None);
@@ -2112,8 +2149,8 @@ mod tests {
 
         let pattern = b"A";
         let text = b"ACG";
-        let status = aligner.align_ends_free(pattern, 0, 0, text, 0, 2);
-        assert_eq!(status, AlignmentStatus::StatusAlgCompleted);
+        let result = aligner.align_ends_free(pattern, 0, 0, text, 0, 2);
+        assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
         assert_eq!(aligner.score(), 1);
         assert_eq!(raw_cigar_string(&aligner), "MII");
     }
@@ -2134,9 +2171,9 @@ mod tests {
         let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
             .affine2p(8, 4, 2, 24, 1)
             .build();
-        let status = aligner.align_end_to_end(&pattern, &text);
+        let result = aligner.align_end_to_end(&pattern, &text);
 
-        assert_eq!(status, AlignmentStatus::StatusAlgCompleted);
+        assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
         assert_eq!(aligner.score(), -36);
         assert_eq!(aligner.cigar_string(None), "19M1X62M8I37M1X12M");
         let (a, b, c) = aligner.matching(&pattern, &text, None);
@@ -2157,8 +2194,8 @@ mod tests {
             .indel()
             .with_heuristics(Heuristics::none())
             .build();
-        let status = aligner.align_end_to_end(&pattern, &text);
-        assert_eq!(status, AlignmentStatus::StatusAlgCompleted);
+        let result = aligner.align_end_to_end(&pattern, &text);
+        assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
         assert_eq!(aligner.score(), 12);
         assert_eq!(aligner.cigar_score(), 12);
         assert_eq!(aligner.cigar_score_clipped(19), 10);
@@ -2194,8 +2231,8 @@ mod tests {
             let mut aligner = WFAligner::builder(AlignmentScope::Alignment, test.memory_mode)
                 .affine2p(8, 4, 2, 24, 1)
                 .build();
-            let status = aligner.align_end_to_end(PATTERN, TEXT);
-            assert_eq!(status, AlignmentStatus::StatusAlgCompleted);
+            let result = aligner.align_end_to_end(PATTERN, TEXT);
+            assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
             assert_eq!(aligner.score(), expected_score);
             assert_eq!(aligner.cigar_score(), expected_score);
             assert_eq!(aligner.cigar_score_clipped(0), expected_score);
@@ -2276,8 +2313,10 @@ mod tests {
             .edit()
             .build();
 
-        let status = aligner.align_end_to_end(PATTERN, TEXT);
-        assert_eq!(status, AlignmentStatus::StatusMaxStepsReached);
+        let result = aligner.align_end_to_end(PATTERN, TEXT);
+        assert_eq!(result.status, AlignmentStatus::StatusMaxStepsReached);
+        assert!(!result.dropped);
+        assert!(result.null_steps >= 0);
     }
 
     #[test]
@@ -2296,20 +2335,20 @@ mod tests {
         // For this pair, this heuristic prunes enough state that BiWFA reaches an end before it
         // can find a midpoint breakpoint. The reached score is above WFA2's
         // BiWFA recovery threshold, so WFA2 reports `WF_STATUS_UNATTAINABLE`.
-        let status = aligner.align_end_to_end(read, allele);
-        assert_eq!(status, AlignmentStatus::StatusUnattainable);
+        let result = aligner.align_end_to_end(read, allele);
+        assert_eq!(result.status, AlignmentStatus::StatusUnattainable);
         assert_eq!(aligner.score(), i32::MIN);
 
         // Setting a more permissive heuristic allows BiWFA to find a midpoint
         // breakpoint and recover with its regular fallback path.
         aligner.set_heuristics(Heuristics::wf_adaptive(1, 10, 75));
-        let status = aligner.align_end_to_end(read, allele);
-        assert_eq!(status, AlignmentStatus::StatusAlgCompleted);
+        let result = aligner.align_end_to_end(read, allele);
+        assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
         assert_eq!(aligner.score(), -881);
 
         aligner.set_heuristics(Heuristics::none());
-        let status = aligner.align_end_to_end(read, allele);
-        assert_eq!(status, AlignmentStatus::StatusAlgCompleted);
+        let result = aligner.align_end_to_end(read, allele);
+        assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
         assert_eq!(aligner.score(), -881);
     }
 
@@ -2454,8 +2493,8 @@ mod tests {
             .affine(4, 6, 2)
             .build();
 
-        let status = aligner.align_end_to_end(pattern, text);
-        assert_eq!(status, AlignmentStatus::StatusAlgCompleted);
+        let result = aligner.align_end_to_end(pattern, text);
+        assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
 
         let sam_cigar_buffer = aligner.get_sam_cigar(true);
         assert!(
@@ -2500,8 +2539,8 @@ mod tests {
             WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryLow)
                 .affine(4, 6, 2)
                 .build();
-        let status_diff = aligner_diff.align_end_to_end(pattern_diff, text_diff);
-        assert_eq!(status_diff, AlignmentStatus::StatusAlgCompleted);
+        let result_diff = aligner_diff.align_end_to_end(pattern_diff, text_diff);
+        assert_eq!(result_diff.status, AlignmentStatus::StatusAlgCompleted);
 
         let sam_cigar_buffer_diff = aligner_diff.get_sam_cigar(true);
 
@@ -2647,8 +2686,8 @@ mod tests {
             )
             .build();
 
-        let status = aligner.align_end_to_end(PATTERN, TEXT);
-        assert_eq!(status, AlignmentStatus::StatusAlgCompleted);
+        let result = aligner.align_end_to_end(PATTERN, TEXT);
+        assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
     }
 
     #[test]
@@ -2681,8 +2720,8 @@ mod tests {
         let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
             .affine(1, 5, 1)
             .build();
-        let status = aligner.align_end_to_end(pattern, text);
-        assert_eq!(status, AlignmentStatus::StatusAlgCompleted);
+        let result = aligner.align_end_to_end(pattern, text);
+        assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
 
         let alignment = aligner.get_alignment();
         assert_eq!(aligner.score(), -18);
@@ -2718,8 +2757,8 @@ mod tests {
             WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryUltraLow)
                 .affine(1, 5, 1)
                 .build();
-        let status = aligner.align_end_to_end(pattern, text);
-        assert_eq!(status, AlignmentStatus::StatusAlgCompleted);
+        let result = aligner.align_end_to_end(pattern, text);
+        assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
 
         let alignment = aligner.get_alignment();
         assert_eq!(aligner.score(), -18);
@@ -2742,9 +2781,9 @@ mod tests {
         let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
             .affine(1, 5, 1)
             .build();
-        let status =
+        let result =
             aligner.align_ends_free(pattern, 0, 0, text, text.len() as i32, text.len() as i32);
-        assert_eq!(status, AlignmentStatus::StatusAlgCompleted);
+        assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
         let alignment = aligner.get_alignment();
         assert_eq!(aligner.score(), 0);
 
