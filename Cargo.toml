@@ -7,6 +7,10 @@ include = ["src/**/*", "LICENSE.md", "README.md", "CHANGELOG.md"]
 [workspace]
 members = ["wfa2-sys"]
 
+[features]
+default = []
+openmp = ["wfa2-sys/openmp"]
+
 [dependencies]
 serde = { version = "1.0.150", features = ["derive"] }
 wfa2-sys = { version = "*", path = "wfa2-sys" }
