@@ -20,7 +20,6 @@ jobs:
           - { os: ubuntu-latest,    name: avx2,         features: "--features avx2", expect_avx2: "1" }
           - { os: ubuntu-24.04-arm, name: linux-arm64,  features: "" }
           - { os: macos-latest,     name: macos-arm64,  features: "" }
-          - { os: macos-13,         name: macos-x86_64, features: "" }
 
     steps:
       - name: Checkout repository and submodules
