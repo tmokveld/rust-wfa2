@@ -95,8 +95,15 @@ assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
 aligner.write_plot("debug.plot").unwrap();
 ```
 
-Heuristics are opt-in. WFA2 supports combining at most one adaptive heuristic,
-one drop heuristic, and one band heuristic:
+Heuristics are opt-in. This intentionally differs from WFA2's C
+`wavefront_aligner_attr_default`, which enables WF-adaptive pruning with
+`min_wavefront_length = 10`, `max_distance_threshold = 50`, and
+`steps_between_cutoffs = 1`. The Rust wrapper defaults to exact alignment unless
+you configure heuristics explicitly; use `Heuristics::wfa2_default()` to recover
+the C default behavior.
+
+WFA2 supports combining at most one adaptive heuristic, one drop heuristic, and
+one band heuristic:
 
 ```rust
 use rust_wfa2::aligner::{

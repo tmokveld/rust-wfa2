@@ -104,6 +104,13 @@ pub enum BandHeuristic {
     Adaptive { min_k: i32, max_k: i32 },
 }
 
+/// WFA2 heuristic configuration.
+///
+/// Rust intentionally defaults to [`Heuristics::none`], unlike WFA2's C
+/// `wavefront_aligner_attr_default`, which enables WF-adaptive pruning with
+/// `min_wavefront_length = 10`, `max_distance_threshold = 50`, and
+/// `steps_between_cutoffs = 1`. This wrapper keeps exact alignment as the
+/// default and requires callers to opt into heuristic pruning explicitly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Heuristics {
@@ -120,6 +127,10 @@ impl Default for Heuristics {
 }
 
 impl Heuristics {
+    /// Disable WFA2 heuristic pruning.
+    ///
+    /// This is the Rust wrapper default. It intentionally differs from WFA2's C
+    /// default attributes, which enable WF-adaptive pruning.
     pub fn none() -> Self {
         Self {
             steps_between_cutoffs: 1,
@@ -137,6 +148,10 @@ impl Heuristics {
         }
     }
 
+    /// Return the heuristic configuration from WFA2's C default attributes.
+    ///
+    /// Use this when porting C code that relied on
+    /// `wavefront_aligner_attr_default.heuristic`.
     pub fn wfa2_default() -> Self {
         Self::wf_adaptive(1, 10, 50)
     }
@@ -773,6 +788,9 @@ struct WFAttributes {
 impl WFAttributes {
     fn default() -> Self {
         let mut inner = unsafe { wfa2::wavefront_aligner_attr_default };
+        // The C default enables WF-adaptive heuristics. The Rust safe wrapper
+        // deliberately defaults to exact alignment; callers can opt back into
+        // the C default with `Heuristics::wfa2_default()`.
         inner.heuristic.strategy = wfa2::wf_heuristic_strategy_wf_heuristic_none;
         Self { inner }
     }
@@ -942,6 +960,14 @@ pub struct WFAlignerBuilder {
 }
 
 impl WFAlignerBuilder {
+    /// Create a builder for a WFA2 aligner.
+    ///
+    /// The builder starts from WFA2's C default attributes with one intentional
+    /// semantic change: heuristics are disabled by default. This keeps Rust
+    /// alignments exact unless callers opt into heuristic pruning with
+    /// [`WFAlignerBuilder::with_heuristics`]. Use
+    /// [`Heuristics::wfa2_default`] to recover the C default WF-adaptive
+    /// heuristic configuration.
     pub fn new(alignment_scope: AlignmentScope, memory_model: MemoryModel) -> Self {
         let attributes = WFAttributes::default()
             .memory_model(memory_model)
