@@ -595,6 +595,48 @@ fn validate_plot_options(resolution_points: i32, align_level: i32) {
     );
 }
 
+fn validate_wfa2_sequence_length(name: &str, len: usize) -> i32 {
+    assert!(
+        len <= i32::MAX as usize,
+        "{name} logical length must fit in i32"
+    );
+    len as i32
+}
+
+fn packed2bits_min_bytes(logical_len: usize) -> usize {
+    (logical_len + 3) / 4
+}
+
+fn validate_packed2bits_sequence(name: &str, sequence: &[u8], logical_len: usize) -> i32 {
+    let logical_len = validate_wfa2_sequence_length(name, logical_len);
+    let min_bytes = packed2bits_min_bytes(logical_len as usize);
+    assert!(
+        sequence.len() >= min_bytes,
+        "{name} packed 2-bit buffer is too short for logical length"
+    );
+    logical_len
+}
+
+/// Pack ASCII DNA into WFA2's 2-bit A/C/G/T layout.
+///
+/// Bases are encoded as A=0, C=1, G=2, and T=3. Base `i` is stored at bit
+/// position `2 * (i % 4)` of byte `i / 4`, so earlier bases occupy lower-order
+/// bits. Uppercase and lowercase A/C/G/T are accepted; any other byte panics.
+pub fn pack_dna_2bits(sequence: &[u8]) -> Vec<u8> {
+    let mut packed = vec![0; packed2bits_min_bytes(sequence.len())];
+    for (i, &base) in sequence.iter().enumerate() {
+        let encoded = match base {
+            b'A' | b'a' => 0,
+            b'C' | b'c' => 1,
+            b'G' | b'g' => 2,
+            b'T' | b't' => 3,
+            _ => panic!("invalid DNA base for 2-bit packing: 0x{base:02X}"),
+        };
+        packed[i / 4] |= encoded << (2 * (i % 4));
+    }
+    packed
+}
+
 fn check_i32(value: i64) -> bool {
     value >= i32::MIN as i64 && value <= i32::MAX as i64
 }
@@ -1520,6 +1562,17 @@ impl WfaRawHandle {
         self.align(pattern, text)
     }
 
+    fn align_end_to_end_packed2bits(
+        &mut self,
+        pattern: &[u8],
+        pattern_len: usize,
+        text: &[u8],
+        text_len: usize,
+    ) -> AlignmentResult {
+        self.set_alignment_end_to_end();
+        self.align_packed2bits(pattern, pattern_len, text, text_len)
+    }
+
     fn align_end_to_end_lambda<F>(
         &mut self,
         pattern_len: usize,
@@ -1562,6 +1615,40 @@ impl WfaRawHandle {
             text_end_free,
         );
         self.align(pattern, text)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn align_ends_free_packed2bits(
+        &mut self,
+        pattern: &[u8],
+        pattern_len: usize,
+        pattern_begin_free: i32,
+        pattern_end_free: i32,
+        text: &[u8],
+        text_len: usize,
+        text_begin_free: i32,
+        text_end_free: i32,
+    ) -> AlignmentResult {
+        if self.memory_model() == MemoryModel::MemoryUltraLow
+            && [
+                pattern_begin_free,
+                pattern_end_free,
+                text_begin_free,
+                text_end_free,
+            ]
+            .iter()
+            .any(|&free_ends| free_ends != 0)
+        {
+            panic!("Ends-free alignment is not supported with MemoryUltraLow");
+        }
+
+        self.set_alignment_ends_free(
+            pattern_begin_free,
+            pattern_end_free,
+            text_begin_free,
+            text_end_free,
+        );
+        self.align_packed2bits(pattern, pattern_len, text, text_len)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1609,6 +1696,21 @@ impl WfaRawHandle {
         self.align(pattern, text)
     }
 
+    fn align_extension_packed2bits(
+        &mut self,
+        pattern: &[u8],
+        pattern_len: usize,
+        text: &[u8],
+        text_len: usize,
+    ) -> AlignmentResult {
+        if self.memory_model() == MemoryModel::MemoryUltraLow {
+            panic!("Extension alignment is not supported with MemoryUltraLow");
+        }
+
+        self.set_alignment_extension();
+        self.align_packed2bits(pattern, pattern_len, text, text_len)
+    }
+
     fn align_extension_lambda<F>(
         &mut self,
         pattern_len: usize,
@@ -1649,6 +1751,31 @@ impl WfaRawHandle {
                 pattern.len() as i32,
                 text.as_ptr() as *const c_char,
                 text.len() as i32,
+            )
+        };
+        let result = self.alignment_result();
+        debug_assert_eq!(result.status, AlignmentStatus::from(raw_status));
+        result
+    }
+
+    fn align_packed2bits(
+        &mut self,
+        pattern: &[u8],
+        pattern_len: usize,
+        text: &[u8],
+        text_len: usize,
+    ) -> AlignmentResult {
+        let pattern_len_i32 = validate_packed2bits_sequence("pattern", pattern, pattern_len);
+        let text_len_i32 = validate_packed2bits_sequence("text", text, text_len);
+
+        self.last_sequence_lengths = Some((pattern_len, text_len));
+        let raw_status = unsafe {
+            wfa2::wavefront_align_packed2bits(
+                self.inner,
+                pattern.as_ptr(),
+                pattern_len_i32,
+                text.as_ptr(),
+                text_len_i32,
             )
         };
         let result = self.alignment_result();
@@ -2183,6 +2310,23 @@ impl WFAligner {
         self.raw.align_end_to_end(pattern, text)
     }
 
+    /// Align packed 2-bit WFA pattern and WFA text inputs end to end.
+    ///
+    /// `pattern_len` and `text_len` are logical unpacked sequence lengths, not
+    /// byte lengths. The packed slices must contain at least `(len + 3) / 4`
+    /// bytes in WFA2's A/C/G/T layout. This method does not pack or allocate
+    /// internally; use [`pack_dna_2bits`] when you need to pack ASCII DNA.
+    pub fn align_end_to_end_packed2bits(
+        &mut self,
+        pattern: &[u8],
+        pattern_len: usize,
+        text: &[u8],
+        text_len: usize,
+    ) -> AlignmentResult {
+        self.raw
+            .align_end_to_end_packed2bits(pattern, pattern_len, text, text_len)
+    }
+
     /// Align WFA pattern/text coordinate spaces with a Rust matcher closure.
     ///
     /// `pattern_len` and `text_len` define the half-open WFA pattern/text index
@@ -2232,6 +2376,37 @@ impl WFAligner {
         )
     }
 
+    /// Align packed 2-bit WFA pattern and WFA text inputs with free ends.
+    ///
+    /// Logical lengths and packed-slice layout follow
+    /// [`WFAligner::align_end_to_end_packed2bits`]. Free-end counts use the
+    /// same WFA pattern/text axes as [`WFAligner::align_ends_free`].
+    /// `MemoryUltraLow` is rejected for nonzero free ends, matching byte-slice
+    /// ends-free alignment.
+    #[allow(clippy::too_many_arguments)]
+    pub fn align_ends_free_packed2bits(
+        &mut self,
+        pattern: &[u8],
+        pattern_len: usize,
+        pattern_begin_free: i32,
+        pattern_end_free: i32,
+        text: &[u8],
+        text_len: usize,
+        text_begin_free: i32,
+        text_end_free: i32,
+    ) -> AlignmentResult {
+        self.raw.align_ends_free_packed2bits(
+            pattern,
+            pattern_len,
+            pattern_begin_free,
+            pattern_end_free,
+            text,
+            text_len,
+            text_begin_free,
+            text_end_free,
+        )
+    }
+
     /// Align WFA pattern/text coordinate spaces with free ends.
     ///
     /// Free-end counts use the same WFA pattern/text axes as
@@ -2273,6 +2448,23 @@ impl WFAligner {
     /// exits the process for extension alignments.
     pub fn align_extension(&mut self, pattern: &[u8], text: &[u8]) -> AlignmentResult {
         self.raw.align_extension(pattern, text)
+    }
+
+    /// Align a right extension of packed 2-bit WFA pattern and WFA text inputs.
+    ///
+    /// Logical lengths and packed-slice layout follow
+    /// [`WFAligner::align_end_to_end_packed2bits`]. `MemoryUltraLow` is
+    /// rejected because WFA2's BiWFA path exits the process for extension
+    /// alignments.
+    pub fn align_extension_packed2bits(
+        &mut self,
+        pattern: &[u8],
+        pattern_len: usize,
+        text: &[u8],
+        text_len: usize,
+    ) -> AlignmentResult {
+        self.raw
+            .align_extension_packed2bits(pattern, pattern_len, text, text_len)
     }
 
     /// Align a right extension over WFA pattern/text coordinate spaces.
@@ -2602,6 +2794,13 @@ mod tests {
         String::from_utf8(aligner.wfa_cigar_bytes()).unwrap()
     }
 
+    fn panic_message<'a>(payload: &'a (dyn Any + Send + 'static)) -> Option<&'a str> {
+        payload
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+    }
+
     fn temp_plot_path(test_name: &str) -> PathBuf {
         let id = PLOT_TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!(
@@ -2819,6 +3018,213 @@ mod tests {
         assert_eq!(
             format!("{}\n{}\n{}", a, b, c),
             "AGCTA-GTGTCAATGGCTACT-T-T-TCAGGTCCT\n| ||| |||||  |||||||| | | |||||||||\nAACTAAGTGTCGGTGGCTACTATATATCAGGTCCT"
+        );
+    }
+
+    #[test]
+    fn test_pack_dna_2bits_layout_and_input_handling() {
+        assert_eq!(pack_dna_2bits(b""), Vec::<u8>::new());
+        assert_eq!(pack_dna_2bits(b"ACGT"), vec![0b1110_0100]);
+        assert_eq!(pack_dna_2bits(b"ACGTA"), vec![0b1110_0100, 0]);
+        assert_eq!(pack_dna_2bits(b"acgt"), vec![0b1110_0100]);
+
+        let result = std::panic::catch_unwind(|| pack_dna_2bits(b"ACGN"));
+        let payload = result.expect_err("expected invalid DNA base panic");
+        assert_eq!(
+            panic_message(payload.as_ref()),
+            Some("invalid DNA base for 2-bit packing: 0x4E")
+        );
+    }
+
+    #[test]
+    fn test_align_end_to_end_packed2bits_matches_byte_alignment_outputs() {
+        let mut byte_aligner =
+            WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
+                .affine(1, 5, 1)
+                .build()
+                .unwrap();
+        let byte_result = byte_aligner.align_end_to_end(PATTERN, TEXT);
+        assert_eq!(byte_result.status, AlignmentStatus::StatusAlgCompleted);
+
+        let byte_score = byte_aligner.score();
+        let byte_wfa_cigar = byte_aligner.wfa_cigar_bytes();
+        let byte_sam_cigar = byte_aligner.sam_cigar_bytes();
+        let byte_wfa_packed = byte_aligner.wfa_packed_cigar(true);
+        let byte_sam_packed = byte_aligner.sam_packed_cigar(true);
+        let byte_match_count = byte_aligner.count_matches();
+        let byte_clipped_score = byte_aligner.cigar_score_clipped(0);
+        let byte_cigar_score = byte_aligner.cigar_score();
+        let byte_span = byte_aligner.get_alignment_span();
+        let byte_alignment = byte_aligner.get_alignment();
+
+        let mut packed_pattern = pack_dna_2bits(PATTERN);
+        let mut packed_text = pack_dna_2bits(TEXT);
+        packed_pattern.push(0xFF);
+        packed_text.push(0xFF);
+
+        let mut packed_aligner =
+            WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
+                .affine(1, 5, 1)
+                .build()
+                .unwrap();
+        let packed_result = packed_aligner.align_end_to_end_packed2bits(
+            &packed_pattern,
+            PATTERN.len(),
+            &packed_text,
+            TEXT.len(),
+        );
+
+        assert_eq!(packed_result.status, byte_result.status);
+        assert_eq!(packed_result.score, byte_result.score);
+        assert_eq!(packed_aligner.score(), byte_score);
+        assert_eq!(packed_aligner.wfa_cigar_bytes(), byte_wfa_cigar);
+        assert_eq!(packed_aligner.sam_cigar_bytes(), byte_sam_cigar);
+        assert_eq!(packed_aligner.wfa_packed_cigar(true), byte_wfa_packed);
+        assert_eq!(packed_aligner.sam_packed_cigar(true), byte_sam_packed);
+        assert_eq!(packed_aligner.count_matches(), byte_match_count);
+        assert_eq!(packed_aligner.cigar_score_clipped(0), byte_clipped_score);
+        assert_eq!(packed_aligner.cigar_score(), byte_cigar_score);
+        assert_eq!(packed_aligner.get_alignment_span(), byte_span);
+        assert_eq!(packed_aligner.get_alignment(), byte_alignment);
+    }
+
+    #[test]
+    fn test_align_end_to_end_packed2bits_supports_score_scope_ultralow() {
+        let mut byte_aligner =
+            WFAligner::builder(AlignmentScope::Score, MemoryModel::MemoryUltraLow)
+                .affine(1, 5, 1)
+                .build()
+                .unwrap();
+        let byte_result = byte_aligner.align_end_to_end(PATTERN, TEXT);
+        assert_eq!(byte_result.status, AlignmentStatus::StatusAlgCompleted);
+
+        let packed_pattern = pack_dna_2bits(PATTERN);
+        let packed_text = pack_dna_2bits(TEXT);
+        let mut packed_aligner =
+            WFAligner::builder(AlignmentScope::Score, MemoryModel::MemoryUltraLow)
+                .affine(1, 5, 1)
+                .build()
+                .unwrap();
+        let packed_result = packed_aligner.align_end_to_end_packed2bits(
+            &packed_pattern,
+            PATTERN.len(),
+            &packed_text,
+            TEXT.len(),
+        );
+
+        assert_eq!(packed_result.status, byte_result.status);
+        assert_eq!(packed_result.score, byte_result.score);
+        assert_eq!(packed_aligner.score(), byte_aligner.score());
+        assert_eq!(packed_aligner.cigar_string(None), "");
+    }
+
+    #[test]
+    fn test_align_end_to_end_packed2bits_handles_empty_sequences() {
+        let text = b"ACGT";
+        let packed_empty = pack_dna_2bits(b"");
+        let packed_text = pack_dna_2bits(text);
+
+        let mut empty_pattern =
+            WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
+                .affine(6, 4, 2)
+                .build()
+                .unwrap();
+        let result =
+            empty_pattern.align_end_to_end_packed2bits(&packed_empty, 0, &packed_text, text.len());
+        assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
+        assert_eq!(raw_cigar_string(&empty_pattern), "IIII");
+        let alignment = empty_pattern.get_alignment();
+        assert_eq!(alignment.xlen, 0);
+        assert_eq!(alignment.ylen, text.len());
+        assert_eq!(empty_pattern.get_alignment_span(), ((0, 0), (0, 4)));
+
+        let mut both_empty = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
+            .affine(6, 4, 2)
+            .build()
+            .unwrap();
+        let result = both_empty.align_end_to_end_packed2bits(&packed_empty, 0, &packed_empty, 0);
+        assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
+        assert_eq!(both_empty.score(), 0);
+        assert_eq!(both_empty.get_alignment_span(), ((0, 0), (0, 0)));
+        assert!(both_empty.wfa_cigar_bytes().is_empty());
+    }
+
+    #[test]
+    fn test_align_end_to_end_packed2bits_ignores_unused_tail_bits() {
+        let pattern = b"ACGTA";
+        let text = b"ACGTA";
+
+        let mut byte_aligner =
+            WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
+                .edit()
+                .build()
+                .unwrap();
+        let byte_result = byte_aligner.align_end_to_end(pattern, text);
+        assert_eq!(byte_result.status, AlignmentStatus::StatusAlgCompleted);
+
+        let mut packed_pattern = pack_dna_2bits(pattern);
+        let mut packed_text = pack_dna_2bits(text);
+        packed_pattern[1] = 0b1111_1100;
+        packed_text[1] = 0b1111_1100;
+
+        let mut packed_aligner =
+            WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
+                .edit()
+                .build()
+                .unwrap();
+        let packed_result = packed_aligner.align_end_to_end_packed2bits(
+            &packed_pattern,
+            pattern.len(),
+            &packed_text,
+            text.len(),
+        );
+
+        assert_eq!(packed_result.status, byte_result.status);
+        assert_eq!(packed_result.score, byte_result.score);
+        assert_eq!(
+            packed_aligner.wfa_cigar_bytes(),
+            byte_aligner.wfa_cigar_bytes()
+        );
+        assert_eq!(
+            packed_aligner.get_alignment_span(),
+            byte_aligner.get_alignment_span()
+        );
+    }
+
+    #[test]
+    fn test_align_end_to_end_packed2bits_rejects_too_large_logical_length() {
+        let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
+            .edit()
+            .build()
+            .unwrap();
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            aligner.align_end_to_end_packed2bits(&[], i32::MAX as usize + 1, &[], 0);
+        }));
+
+        let payload = result.expect_err("expected packed logical length panic");
+        assert_eq!(
+            panic_message(payload.as_ref()),
+            Some("pattern logical length must fit in i32")
+        );
+    }
+
+    #[test]
+    fn test_align_end_to_end_packed2bits_rejects_short_backing_slice() {
+        let packed_text = pack_dna_2bits(b"A");
+        let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
+            .edit()
+            .build()
+            .unwrap();
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            aligner.align_end_to_end_packed2bits(&[], 1, &packed_text, 1);
+        }));
+
+        let payload = result.expect_err("expected short packed buffer panic");
+        assert_eq!(
+            panic_message(payload.as_ref()),
+            Some("pattern packed 2-bit buffer is too short for logical length")
         );
     }
 
@@ -3264,6 +3670,114 @@ mod tests {
     }
 
     #[test]
+    fn test_align_ends_free_packed2bits_matches_byte_alignment_outputs() {
+        let pattern = b"AATTTAAGTCTAGGCTACTTTC";
+        let text = b"CCGACTACTACGAAATTTAAGTATAGGCTACTTTCCGTACGTACGTACGT";
+        let text_end_free = text.len() as i32;
+
+        let mut byte_aligner =
+            WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
+                .affine(6, 4, 2)
+                .build()
+                .unwrap();
+        let byte_result = byte_aligner.align_ends_free(pattern, 0, 0, text, 0, text_end_free);
+        assert_eq!(byte_result.status, AlignmentStatus::StatusAlgCompleted);
+
+        let byte_score = byte_aligner.score();
+        let byte_wfa_cigar = byte_aligner.wfa_cigar_bytes();
+        let byte_sam_cigar = byte_aligner.sam_cigar_bytes();
+        let byte_wfa_packed = byte_aligner.wfa_packed_cigar(true);
+        let byte_sam_packed = byte_aligner.sam_packed_cigar(true);
+        let byte_span = byte_aligner.get_alignment_span();
+        let byte_alignment = byte_aligner.get_alignment();
+
+        let packed_pattern = pack_dna_2bits(pattern);
+        let packed_text = pack_dna_2bits(text);
+        let mut packed_aligner =
+            WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
+                .affine(6, 4, 2)
+                .build()
+                .unwrap();
+        let packed_result = packed_aligner.align_ends_free_packed2bits(
+            &packed_pattern,
+            pattern.len(),
+            0,
+            0,
+            &packed_text,
+            text.len(),
+            0,
+            text_end_free,
+        );
+
+        assert_eq!(packed_result.status, byte_result.status);
+        assert_eq!(packed_result.score, byte_result.score);
+        assert_eq!(packed_aligner.score(), byte_score);
+        assert_eq!(packed_aligner.wfa_cigar_bytes(), byte_wfa_cigar);
+        assert_eq!(packed_aligner.sam_cigar_bytes(), byte_sam_cigar);
+        assert_eq!(packed_aligner.wfa_packed_cigar(true), byte_wfa_packed);
+        assert_eq!(packed_aligner.sam_packed_cigar(true), byte_sam_packed);
+        assert_eq!(packed_aligner.get_alignment_span(), byte_span);
+        assert_eq!(packed_aligner.get_alignment(), byte_alignment);
+    }
+
+    #[test]
+    fn test_align_ends_free_packed2bits_rejects_ultralow_nonzero_free_ends() {
+        let packed = pack_dna_2bits(b"ACGT");
+        let mut aligner =
+            WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryUltraLow)
+                .edit()
+                .build()
+                .unwrap();
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            aligner.align_ends_free_packed2bits(&packed, 4, 0, 1, &packed, 4, 0, 0);
+        }));
+
+        let payload = result.expect_err("expected MemoryUltraLow ends-free packed rejection");
+        assert_eq!(
+            panic_message(payload.as_ref()),
+            Some("Ends-free alignment is not supported with MemoryUltraLow")
+        );
+    }
+
+    #[test]
+    fn test_align_ends_free_packed2bits_ultralow_all_zero_matches_global() {
+        let packed_pattern = pack_dna_2bits(PATTERN);
+        let packed_text = pack_dna_2bits(TEXT);
+
+        let mut global = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryUltraLow)
+            .affine(1, 5, 1)
+            .build()
+            .unwrap();
+        let global_result = global.align_end_to_end_packed2bits(
+            &packed_pattern,
+            PATTERN.len(),
+            &packed_text,
+            TEXT.len(),
+        );
+        assert_eq!(global_result.status, AlignmentStatus::StatusAlgCompleted);
+        let global_score = global.score();
+
+        let mut ends_free =
+            WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryUltraLow)
+                .affine(1, 5, 1)
+                .build()
+                .unwrap();
+        let ends_free_result = ends_free.align_ends_free_packed2bits(
+            &packed_pattern,
+            PATTERN.len(),
+            0,
+            0,
+            &packed_text,
+            TEXT.len(),
+            0,
+            0,
+        );
+        assert_eq!(ends_free_result.status, AlignmentStatus::StatusAlgCompleted);
+        assert_eq!(ends_free.score(), global_score);
+    }
+
+    #[test]
     fn test_ends_free_with_match_penalties() {
         let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryLow)
             .affine_with_match(-1, 3, 2, 1)
@@ -3464,6 +3978,54 @@ mod tests {
     }
 
     #[test]
+    fn test_align_extension_packed2bits_matches_byte_alignment_outputs() {
+        let pattern = b"AATTTAAGTCTGCTACTTTCACGCAGCT";
+        let text = b"AATTTCAGTCTGGCTACTTTCACGTACGATGACAGACTCT";
+
+        let mut byte_aligner =
+            WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
+                .affine(6, 4, 2)
+                .build()
+                .unwrap();
+        let byte_result = byte_aligner.align_extension(pattern, text);
+        assert_eq!(byte_result.status, AlignmentStatus::StatusAlgPartial);
+
+        let byte_score = byte_aligner.score();
+        let byte_wfa_cigar = byte_aligner.wfa_cigar_bytes();
+        let byte_sam_cigar = byte_aligner.sam_cigar_bytes();
+        let byte_wfa_packed = byte_aligner.wfa_packed_cigar(true);
+        let byte_sam_packed = byte_aligner.sam_packed_cigar(true);
+        let byte_cigar_score = byte_aligner.cigar_score();
+        let byte_span = byte_aligner.get_alignment_span();
+        let byte_alignment = byte_aligner.get_alignment();
+
+        let packed_pattern = pack_dna_2bits(pattern);
+        let packed_text = pack_dna_2bits(text);
+        let mut packed_aligner =
+            WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
+                .affine(6, 4, 2)
+                .build()
+                .unwrap();
+        let packed_result = packed_aligner.align_extension_packed2bits(
+            &packed_pattern,
+            pattern.len(),
+            &packed_text,
+            text.len(),
+        );
+
+        assert_eq!(packed_result.status, byte_result.status);
+        assert_eq!(packed_result.score, byte_result.score);
+        assert_eq!(packed_aligner.score(), byte_score);
+        assert_eq!(packed_aligner.wfa_cigar_bytes(), byte_wfa_cigar);
+        assert_eq!(packed_aligner.sam_cigar_bytes(), byte_sam_cigar);
+        assert_eq!(packed_aligner.wfa_packed_cigar(true), byte_wfa_packed);
+        assert_eq!(packed_aligner.sam_packed_cigar(true), byte_sam_packed);
+        assert_eq!(packed_aligner.cigar_score(), byte_cigar_score);
+        assert_eq!(packed_aligner.get_alignment_span(), byte_span);
+        assert_eq!(packed_aligner.get_alignment(), byte_alignment);
+    }
+
+    #[test]
     fn test_align_extension_lambda_empty_prefix_has_zero_span() {
         let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
             .affine(6, 4, 2)
@@ -3471,6 +4033,29 @@ mod tests {
             .unwrap();
 
         let result = aligner.align_extension_lambda(8, 8, |_, _| false);
+        assert_eq!(result.status, AlignmentStatus::StatusAlgPartial);
+        assert_eq!(aligner.cigar_string(None), "");
+
+        let alignment = aligner.get_alignment();
+        assert!(alignment.operations.is_empty());
+        assert_eq!(alignment.xstart, 0);
+        assert_eq!(alignment.xend, 0);
+        assert_eq!(alignment.ystart, 0);
+        assert_eq!(alignment.yend, 0);
+
+        assert_eq!(aligner.get_alignment_span(), ((0, 0), (0, 0)));
+    }
+
+    #[test]
+    fn test_align_extension_packed2bits_empty_prefix_has_zero_span() {
+        let packed_pattern = pack_dna_2bits(b"AAAAAAAA");
+        let packed_text = pack_dna_2bits(b"TTTTTTTT");
+        let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
+            .affine(6, 4, 2)
+            .build()
+            .unwrap();
+
+        let result = aligner.align_extension_packed2bits(&packed_pattern, 8, &packed_text, 8);
         assert_eq!(result.status, AlignmentStatus::StatusAlgPartial);
         assert_eq!(aligner.cigar_string(None), "");
 
@@ -3510,6 +4095,26 @@ mod tests {
             Some("Extension alignment is not supported with MemoryUltraLow")
         );
         assert_eq!(matcher_calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_align_extension_packed2bits_rejects_ultralow_memory() {
+        let packed = pack_dna_2bits(b"ACGT");
+        let mut aligner =
+            WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryUltraLow)
+                .affine(6, 4, 2)
+                .build()
+                .unwrap();
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            aligner.align_extension_packed2bits(&packed, 4, &packed, 4);
+        }));
+
+        let payload = result.expect_err("expected MemoryUltraLow extension packed rejection");
+        assert_eq!(
+            panic_message(payload.as_ref()),
+            Some("Extension alignment is not supported with MemoryUltraLow")
+        );
     }
 
     #[test]
