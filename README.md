@@ -76,14 +76,14 @@ let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::Mem
     .affine(6, 4, 2)
     .build().unwrap();
 
-let pattern = b"TCTTTACTCGCGCGTTGGAGAAATACAATAGT";
-let text = b"TCTATACTGCGCGTTTGGAGAAATAAAATAGT";
-let result = aligner.align_end_to_end(pattern, text);
+let query = b"TCTTTACTCGCGCGTTGGAGAAATACAATAGT";
+let reference = b"TCTATACTGCGCGTTTGGAGAAATAAAATAGT";
+let result = aligner.align_end_to_end(query, reference);
 assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
 assert_eq!(aligner.score(), -24);
 assert_eq!(
-    aligner.cigar_operations(),
-    b"MMMXMMMMDMMMMMMMIMMMMMMMMMXMMMMMM"
+    aligner.sam_cigar_bytes(),
+    b"MMMXMMMMIMMMMMMMMDMMMMMMMMMXMMMMMM"
 );
 ```
 
@@ -94,10 +94,9 @@ WFA2 CIGAR operations describe how to transform the `pattern` argument into the
 is usually the reference, so raw WFA2 operations use the opposite insertion and
 deletion orientation from SAM's reference-to-query CIGAR semantics.
 
-`get_sam_cigar()` uses BAM/SAM's packed integer encoding, but it does not change
-that WFA2 operation orientation. For SAM-compliant reference/query CIGAR output,
-either call the aligner with `pattern = reference` and `text = query`, or swap
-`I` and `D` after decoding.
+Use `sam_cigar()` or `sam_packed_cigar()` when the last alignment was called with `pattern = query` and `text = reference`. Use `wfa_cigar_bytes()`,
+`wfa_cigar()`, or `wfa_packed_cigar()` when you want WFA's native
+pattern-to-text orientation, including reference-first workflows.
 
 ### WFA2 plot dumps
 

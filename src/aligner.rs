@@ -1167,6 +1167,32 @@ fn operation_bytes(operations: &[std::os::raw::c_char]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(operations.as_ptr() as *const u8, operations.len()) }
 }
 
+fn swap_indel_ops_in_packed_cigar(cigar: &mut [u32]) {
+    const SAM_CIGAR_OP_MASK: u32 = 0xF;
+    const SAM_CIGAR_INS: u32 = 1;
+    const SAM_CIGAR_DEL: u32 = 2;
+
+    for encoded_op in cigar {
+        let op_code = *encoded_op & SAM_CIGAR_OP_MASK;
+        let swapped_op = match op_code {
+            SAM_CIGAR_INS => SAM_CIGAR_DEL,
+            SAM_CIGAR_DEL => SAM_CIGAR_INS,
+            _ => continue,
+        };
+        *encoded_op = (*encoded_op & !SAM_CIGAR_OP_MASK) | swapped_op;
+    }
+}
+
+fn swap_indel_ops_in_cigar_bytes(cigar: &mut [u8]) {
+    for op in cigar {
+        *op = match *op {
+            b'I' => b'D',
+            b'D' => b'I',
+            other => other,
+        };
+    }
+}
+
 impl<'a> CigarView<'a> {
     fn new(
         score: i32,
@@ -1741,7 +1767,7 @@ impl WfaRawHandle {
         unsafe { (*self.inner).alignment_form.extension }
     }
 
-    fn sam_cigar(&self, show_mismatches: bool) -> Vec<u32> {
+    fn wfa_packed_cigar(&self, show_mismatches: bool) -> Vec<u32> {
         if self.inner.is_null() {
             panic!("Internal aligner pointer is null");
         }
@@ -2103,18 +2129,13 @@ impl WFAligner {
         self.raw.alignment_span()
     }
 
-    /// Return WFA2's raw CIGAR operations.
+    /// Return WFA2's raw CIGAR operation bytes.
     ///
     /// These operations follow WFA2's native orientation: they describe how to
-    /// transform the `pattern` argument into the `text` argument. With the
-    /// conventional Rust wrapper naming of `pattern` as query and `text` as
-    /// reference, `I` consumes text/reference and `D` consumes pattern/query.
-    ///
-    /// This is the opposite insertion/deletion orientation from SAM, which
-    /// describes how to transform reference into query.
-    pub fn cigar_operations(&self) -> Vec<u8> {
+    /// transform the `pattern` argument into the `text` argument.
+    pub fn wfa_cigar_bytes(&self) -> Vec<u8> {
         if self.raw.alignment_scope() == AlignmentScope::Score {
-            return Vec::new();
+            panic!("Cannot get WFA CIGAR bytes when AlignmentScope is Score");
         }
 
         let cigar_str = self
@@ -2124,33 +2145,49 @@ impl WFAligner {
         cigar_str.to_vec()
     }
 
+    /// Return raw CIGAR operation bytes in SAM reference-to-query orientation.
+    ///
+    /// This method assumes the last alignment used `pattern` as query and `text`
+    /// as reference. It converts WFA's pattern-to-text orientation by swapping
+    /// `I` and `D` operations.
+    pub fn sam_cigar_bytes(&self) -> Vec<u8> {
+        let mut cigar = self.wfa_cigar_bytes();
+        swap_indel_ops_in_cigar_bytes(&mut cigar);
+        cigar
+    }
+
     /// Return WFA2's CIGAR encoded in BAM/SAM's packed integer format.
     ///
     /// The integer packing follows the BAM convention (`len << 4 | op_code`),
-    /// but the operation stream still has WFA2's native orientation: it
-    /// transforms the `pattern` argument into the `text` argument. If callers
-    /// pass `pattern` as query and `text` as reference, `I` and `D` are reversed
-    /// relative to SAM's reference-to-query semantics.
+    /// but the operation stream keeps WFA2's native orientation: it describes
+    /// how to transform the `pattern` argument into the `text` argument.
+    pub fn wfa_packed_cigar(&self, show_mismatches: bool) -> Vec<u32> {
+        if self.raw.alignment_scope() == AlignmentScope::Score {
+            panic!("Cannot get WFA packed CIGAR when AlignmentScope is Score");
+        }
+        self.raw.wfa_packed_cigar(show_mismatches)
+    }
+
+    /// Return a SAM-oriented CIGAR encoded in BAM/SAM's packed integer format.
     ///
-    /// For SAM-compliant reference/query CIGAR semantics, either call the
-    /// aligner with the arguments swapped (`pattern = reference`,
-    /// `text = query`) or swap `I` and `D` after decoding.
-    pub fn get_sam_cigar(&self, show_mismatches: bool) -> Vec<u32> {
+    /// This method assumes the last alignment used `pattern` as query and `text`
+    /// as reference. It converts WFA's pattern-to-text orientation by swapping
+    /// packed `I` and `D` op codes.
+    pub fn sam_packed_cigar(&self, show_mismatches: bool) -> Vec<u32> {
         if self.raw.alignment_scope() == AlignmentScope::Score {
             panic!("Cannot get SAM CIGAR when AlignmentScope is Score");
         }
-        self.raw.sam_cigar(show_mismatches)
+        let mut cigar = self.raw.wfa_packed_cigar(show_mismatches);
+        swap_indel_ops_in_packed_cigar(&mut cigar);
+        cigar
     }
 
-    /// Decode BAM/SAM packed CIGAR integers into `(length, op)` pairs.
-    ///
-    /// This only decodes the integer representation. It does not normalize
-    /// WFA2's pattern-to-text operation orientation into SAM's reference-to-query
-    /// orientation.
-    pub fn decode_sam_cigar(sam_cigar_buffer: &[u32]) -> Vec<CigarOp> {
+    /// Decode BAM/SAM packed CIGAR integers into `(length, op)` pairs without
+    /// changing operation orientation.
+    pub fn decode_packed_cigar(packed_cigar: &[u32]) -> Vec<CigarOp> {
         const SAM_CIGAR_LEN_SHIFT: u32 = 4;
         const SAM_CIGAR_OP_MASK: u32 = 0xF;
-        sam_cigar_buffer
+        packed_cigar
             .iter()
             .map(|&encoded_op| {
                 let len = encoded_op >> SAM_CIGAR_LEN_SHIFT; // Length is in the upper 28 bits
@@ -2170,6 +2207,21 @@ impl WFAligner {
                 (len as usize, op_char)
             })
             .collect()
+    }
+
+    /// Return WFA2's packed CIGAR decoded into `(length, op)` pairs.
+    ///
+    /// The operation orientation is WFA pattern-to-text.
+    pub fn wfa_cigar(&self, show_mismatches: bool) -> Vec<CigarOp> {
+        Self::decode_packed_cigar(&self.wfa_packed_cigar(show_mismatches))
+    }
+
+    /// Return a SAM-oriented CIGAR decoded into `(length, op)` pairs.
+    ///
+    /// This method assumes the last alignment used `pattern` as query and `text`
+    /// as reference.
+    pub fn sam_cigar(&self, show_mismatches: bool) -> Vec<CigarOp> {
+        Self::decode_packed_cigar(&self.sam_packed_cigar(show_mismatches))
     }
 
     /// Counts the number of match ('M') operations in the CIGAR string.
@@ -2291,7 +2343,7 @@ mod tests {
     static PLOT_TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     fn raw_cigar_string(aligner: &WFAligner) -> String {
-        String::from_utf8(aligner.cigar_operations()).unwrap()
+        String::from_utf8(aligner.wfa_cigar_bytes()).unwrap()
     }
 
     fn temp_plot_path(test_name: &str) -> PathBuf {
@@ -2372,7 +2424,7 @@ mod tests {
         aligner.reap();
 
         let first_result = aligner.align_end_to_end(PATTERN, TEXT);
-        let first_cigar = aligner.cigar_operations();
+        let first_cigar = aligner.wfa_cigar_bytes();
         assert_eq!(first_result.status, AlignmentStatus::StatusAlgCompleted);
         assert_eq!(first_result.score, 7);
         assert_eq!(first_cigar, b"MXMMMIMMMMMXXMMMMMMMMIMIMIMMMMMMMMM");
@@ -2387,7 +2439,7 @@ mod tests {
         assert_eq!(second_result.status, AlignmentStatus::StatusAlgCompleted);
         assert_eq!(second_result.score, 4);
         assert_eq!(
-            aligner.cigar_operations(),
+            aligner.wfa_cigar_bytes(),
             b"MMMXMMMMDMMMMMMMIMMMMMMMMMXMMMMMM"
         );
     }
@@ -2561,7 +2613,7 @@ mod tests {
         assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
         assert_eq!(aligner.score(), -24);
         assert_eq!(
-            aligner.cigar_operations(),
+            aligner.wfa_cigar_bytes(),
             b"MMMXMMMMDMMMMMMMIMMMMMMMMMXMMMMMM"
         );
     }
@@ -3399,7 +3451,7 @@ mod tests {
     }
 
     #[test]
-    fn test_get_and_decode_sam_cigar() {
+    fn test_get_and_decode_packed_cigar() {
         let pattern = b"TCTTTACTCTT";
         let text = b"TCTTTACTCTT";
         let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
@@ -3410,13 +3462,13 @@ mod tests {
         let result = aligner.align_end_to_end(pattern, text);
         assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
 
-        let sam_cigar_buffer = aligner.get_sam_cigar(true);
+        let sam_cigar_buffer = aligner.sam_packed_cigar(true);
         assert!(
             !sam_cigar_buffer.is_empty(),
             "SAM CIGAR buffer should not be empty"
         );
 
-        let decoded_cigar = WFAligner::decode_sam_cigar(&sam_cigar_buffer);
+        let decoded_cigar = WFAligner::decode_packed_cigar(&sam_cigar_buffer);
 
         // Expected result for identical sequences (11 matches), The raw buffer encodes length << 4 | op_code. '=' is op_code 7. So, 11= should be encoded as (11 << 4) | 7 = 176 | 7 = 183
         let expected_raw_buffer = vec![183]; // 11=
@@ -3432,7 +3484,7 @@ mod tests {
         );
 
         // Test with show_mismatches = false
-        let sam_cigar_buffer_m = aligner.get_sam_cigar(false);
+        let sam_cigar_buffer_m = aligner.sam_packed_cigar(false);
         // 'M' is op_code 0. (11 << 4) | 0 = 176
         let expected_raw_buffer_m = vec![176]; // 11M
         assert_eq!(
@@ -3440,7 +3492,7 @@ mod tests {
             "Raw SAM CIGAR buffer mismatch (M)"
         );
 
-        let decoded_cigar_m = WFAligner::decode_sam_cigar(&sam_cigar_buffer_m);
+        let decoded_cigar_m = WFAligner::decode_packed_cigar(&sam_cigar_buffer_m);
         let expected_decoded_cigar_m: Vec<CigarOp> = vec![(11, 'M')]; // 11 matches ('M')
         assert_eq!(
             decoded_cigar_m, expected_decoded_cigar_m,
@@ -3457,7 +3509,7 @@ mod tests {
         let result_diff = aligner_diff.align_end_to_end(pattern_diff, text_diff);
         assert_eq!(result_diff.status, AlignmentStatus::StatusAlgCompleted);
 
-        let sam_cigar_buffer_diff = aligner_diff.get_sam_cigar(true);
+        let sam_cigar_buffer_diff = aligner_diff.sam_packed_cigar(true);
 
         let expected_raw_diff = vec![135, 24, 39];
         assert_eq!(
@@ -3465,7 +3517,7 @@ mod tests {
             "Raw SAM CIGAR buffer mismatch (diff)"
         );
 
-        let decoded_cigar_diff = WFAligner::decode_sam_cigar(&sam_cigar_buffer_diff);
+        let decoded_cigar_diff = WFAligner::decode_packed_cigar(&sam_cigar_buffer_diff);
         let expected_decoded_diff: Vec<CigarOp> = vec![(8, '='), (1, 'X'), (2, '=')];
         assert_eq!(
             decoded_cigar_diff, expected_decoded_diff,
@@ -3473,7 +3525,7 @@ mod tests {
         );
 
         // Test with show_mismatches = false
-        let sam_cigar_buffer_diff_m = aligner_diff.get_sam_cigar(false);
+        let sam_cigar_buffer_diff_m = aligner_diff.sam_packed_cigar(false);
         // Expected: 11M => (11<<4)|0 = 176
         let expected_raw_diff_m = vec![176];
         assert_eq!(
@@ -3481,12 +3533,36 @@ mod tests {
             "Raw SAM CIGAR buffer mismatch (diff, M)"
         );
 
-        let decoded_cigar_diff_m = WFAligner::decode_sam_cigar(&sam_cigar_buffer_diff_m);
+        let decoded_cigar_diff_m = WFAligner::decode_packed_cigar(&sam_cigar_buffer_diff_m);
         let expected_decoded_diff_m: Vec<CigarOp> = vec![(11, 'M')];
         assert_eq!(
             decoded_cigar_diff_m, expected_decoded_diff_m,
             "Decoded SAM CIGAR mismatch (diff, M)"
         );
+    }
+
+    #[test]
+    fn test_wfa_and_sam_cigars_have_explicit_indel_orientation() {
+        let query = b"ACGTT";
+        let reference = b"ACGT";
+        let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
+            .edit()
+            .build()
+            .unwrap();
+
+        let result = aligner.align_end_to_end(query, reference);
+        assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
+        assert_eq!(aligner.wfa_cigar_bytes(), b"MMMMD");
+        assert_eq!(aligner.sam_cigar_bytes(), b"MMMMI");
+        assert_eq!(aligner.wfa_packed_cigar(false), vec![64, 18]);
+        assert_eq!(aligner.sam_packed_cigar(false), vec![64, 17]);
+        assert_eq!(aligner.wfa_cigar(false), vec![(4, 'M'), (1, 'D')]);
+        assert_eq!(aligner.sam_cigar(false), vec![(4, 'M'), (1, 'I')]);
+
+        let result = aligner.align_end_to_end(reference, query);
+        assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
+        assert_eq!(aligner.wfa_cigar_bytes(), b"MMMMI");
+        assert_eq!(aligner.wfa_packed_cigar(false), vec![64, 17]);
     }
 
     #[test]
@@ -3971,7 +4047,7 @@ mod tests {
 
     #[test]
     #[allow(clippy::identity_op)] // `| 0` kept for column alignment with the other op codes
-    fn test_decode_sam_cigar_covers_all_op_codes_and_unknown_fallback() {
+    fn test_decode_packed_cigar_covers_all_op_codes_and_unknown_fallback() {
         // Encoding is (length << 4) | op_code. Cover every documented op code plus an
         // out-of-range code (>= 9) that must decode to the '?' fallback.
         let buffer = vec![
@@ -3986,7 +4062,7 @@ mod tests {
             (9u32 << 4) | 8,  // 9X
             (10u32 << 4) | 9, // 10? (unknown op code)
         ];
-        let decoded = WFAligner::decode_sam_cigar(&buffer);
+        let decoded = WFAligner::decode_packed_cigar(&buffer);
         assert_eq!(
             decoded,
             vec![
@@ -4005,18 +4081,18 @@ mod tests {
     }
 
     #[test]
-    fn test_decode_sam_cigar_empty_buffer() {
-        assert!(WFAligner::decode_sam_cigar(&[]).is_empty());
+    fn test_decode_packed_cigar_empty_buffer() {
+        assert!(WFAligner::decode_packed_cigar(&[]).is_empty());
     }
 
     #[test]
     #[allow(clippy::identity_op)] // `| 0` documents the 'M' op code (0) explicitly
-    fn test_decode_sam_cigar_decodes_large_lengths() {
+    fn test_decode_packed_cigar_decodes_large_lengths() {
         // 28-bit maximum length must survive the >> 4 shift without truncation.
         let max_len = (1u32 << 28) - 1;
         let buffer = vec![(max_len << 4) | 0];
         assert_eq!(
-            WFAligner::decode_sam_cigar(&buffer),
+            WFAligner::decode_packed_cigar(&buffer),
             vec![(max_len as usize, 'M')]
         );
     }
@@ -4043,12 +4119,22 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "Cannot get SAM CIGAR when AlignmentScope is Score")]
-    fn test_get_sam_cigar_rejects_score_scope() {
+    fn test_sam_packed_cigar_rejects_score_scope() {
         let aligner = WFAligner::builder(AlignmentScope::Score, MemoryModel::MemoryHigh)
             .edit()
             .build()
             .unwrap();
-        aligner.get_sam_cigar(true);
+        aligner.sam_packed_cigar(true);
+    }
+
+    #[test]
+    #[should_panic(expected = "Cannot get WFA packed CIGAR when AlignmentScope is Score")]
+    fn test_wfa_packed_cigar_rejects_score_scope() {
+        let aligner = WFAligner::builder(AlignmentScope::Score, MemoryModel::MemoryHigh)
+            .edit()
+            .build()
+            .unwrap();
+        aligner.wfa_packed_cigar(true);
     }
 
     #[test]
@@ -4062,16 +4148,27 @@ mod tests {
     }
 
     #[test]
-    fn test_cigar_operations_empty_under_score_scope() {
-        // Unlike the other accessors, cigar_operations() is documented to return an empty
-        // Vec (not panic) when scope is Score.
+    #[should_panic(expected = "Cannot get WFA CIGAR bytes when AlignmentScope is Score")]
+    fn test_wfa_cigar_bytes_rejects_score_scope() {
         let mut aligner = WFAligner::builder(AlignmentScope::Score, MemoryModel::MemoryHigh)
             .edit()
             .build()
             .unwrap();
         let result = aligner.align_end_to_end(PATTERN, TEXT);
         assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
-        assert!(aligner.cigar_operations().is_empty());
+        aligner.wfa_cigar_bytes();
+    }
+
+    #[test]
+    #[should_panic(expected = "Cannot get WFA CIGAR bytes when AlignmentScope is Score")]
+    fn test_sam_cigar_bytes_rejects_score_scope() {
+        let mut aligner = WFAligner::builder(AlignmentScope::Score, MemoryModel::MemoryHigh)
+            .edit()
+            .build()
+            .unwrap();
+        let result = aligner.align_end_to_end(PATTERN, TEXT);
+        assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
+        aligner.sam_cigar_bytes();
     }
 
     #[test]
@@ -4230,7 +4327,7 @@ mod tests {
         assert_eq!(alignment.xlen, 0);
         assert_eq!(alignment.ylen, 0);
         assert_eq!(aligner.get_alignment_span(), ((0, 0), (0, 0)));
-        assert!(aligner.cigar_operations().is_empty());
+        assert!(aligner.wfa_cigar_bytes().is_empty());
     }
 
     #[test]
