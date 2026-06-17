@@ -3970,6 +3970,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::identity_op)] // `| 0` kept for column alignment with the other op codes
     fn test_decode_sam_cigar_covers_all_op_codes_and_unknown_fallback() {
         // Encoding is (length << 4) | op_code. Cover every documented op code plus an
         // out-of-range code (>= 9) that must decode to the '?' fallback.
@@ -4009,6 +4010,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::identity_op)] // `| 0` documents the 'M' op code (0) explicitly
     fn test_decode_sam_cigar_decodes_large_lengths() {
         // 28-bit maximum length must survive the >> 4 shift without truncation.
         let max_len = (1u32 << 28) - 1;

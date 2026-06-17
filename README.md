@@ -5,9 +5,35 @@ Rust language bindings for the excellent
 
 Work in progress. Tests and features are not yet complete.
 
-## Autovectorization
+## Native codegen (SIMD)
 
-Remember to specify the correct C compiler! For me it is `CC=/usr/local/opt/llvm/bin/clang`.
+The WFA2 C library is always compiled in an optimized (`-O3`,
+release) configuration with autovectorization enabled, so the default build is
+portable and runs on any CPU of the target architecture. No extra flags are
+required.
+
+WFA2 also ships a AVX2 extend kernel that is only compiled in when
+the compiler defines `__AVX2__` (i.e. when AVX2 codegen is enabled). Because
+emitting AVX2 instructions makes the binary crash on CPUs without AVX2, this is
+**opt-in** via two features (both off by default):
+
+```sh
+# Portable to any AVX2-capable x86_64 CPU (Haswell, 2013+):
+cargo build --release --features avx2
+
+# Tune for the building machine specifically (-march=native).
+# Fastest, but the resulting binary is not portable to other CPUs:
+cargo build --release --features native
+```
+
+Notes:
+
+- `avx2` only affects `x86_64`; on other architectures it is ignored with a
+  build warning.
+- `native` works on any architecture and is the superset, so it takes
+  precedence if both are enabled.
+- You can still override the C compiler if needed, e.g.
+  `CC=/usr/local/opt/llvm/bin/clang`.
 
 ## OpenMP
 

@@ -11,6 +11,9 @@ members = ["wfa2-sys"]
 default = []
 openmp = ["wfa2-sys/openmp"]
 serde = ["dep:serde"]
+# Opt-in native codegen forwarded to wfa2-sys (off by default; see wfa2-sys).
+avx2 = ["wfa2-sys/avx2"]
+native = ["wfa2-sys/native"]
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"], optional = true }

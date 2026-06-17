@@ -20,12 +20,23 @@ fn main() {
     emit_rerun_if_env_changed();
 
     let mut cmake = cmake::Config::new("WFA2-lib");
-    cmake
-        .cflag("-DCMAKE_BUILD_TYPE=Release")
-        // As recommended by the README on master.
-        .cflag(
-            "-DEXTRA_FLAGS=\"-ftree-vectorize -msse2 -mfpmath=sse -ftree-vectorizer-verbose=5\"",
-        );
+    // Force an optimized C build regardless of the Cargo profile. WFA2's CMakeLists only appends
+    // OPTIMIZE_FLAGS (including EXTRA_FLAGS) for Release/RelWithDebInfo builds.
+    cmake.profile("Release");
+
+    // EXTRA_FLAGS is a cmake cache variable consumed by WFA2's CMakeLists, not a C preprocessor
+    // flag. It must be passed via `define` so cmake appends it to CMAKE_C_FLAGS/CMAKE_CXX_FLAGS;
+    // passing it through `cflag` only defines an unused `-DEXTRA_FLAGS=...` macro.
+    let mut extra_flags = String::from("-ftree-vectorize");
+    if target_arch() == "x86_64" {
+        // SSE tuning is x86-only. Enabling it on aarch64 (e.g. Apple Silicon) fails the build.
+        extra_flags.push_str(" -msse2 -mfpmath=sse");
+    }
+    for flag in native_codegen_flags() {
+        extra_flags.push(' ');
+        extra_flags.push_str(flag);
+    }
+    cmake.define("EXTRA_FLAGS", &extra_flags);
 
     if openmp_enabled {
         cmake.define("OPENMP", "ON");
@@ -155,6 +166,35 @@ fn compiler_looks_like_clang() -> bool {
 
 fn target_os() -> String {
     env::var("CARGO_CFG_TARGET_OS").unwrap_or_default()
+}
+
+fn target_arch() -> String {
+    env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default()
+}
+
+/// Opt-in native codegen flags for WFA2's SIMD extend kernels (off by default).
+///
+/// `native` (`-march=native`) tunes for the building machine and is the superset, so it
+/// takes precedence over `avx2`. `avx2` (`-mavx2`) only makes sense on x86_64, where it
+/// defines `__AVX2__` and activates WFA2's hand-written AVX2 kernel; on other targets it is
+/// ignored with a warning rather than failing the build.
+fn native_codegen_flags() -> Vec<&'static str> {
+    let native = env::var_os("CARGO_FEATURE_NATIVE").is_some();
+    let avx2 = env::var_os("CARGO_FEATURE_AVX2").is_some();
+
+    if native {
+        return vec!["-march=native"];
+    }
+    if avx2 {
+        if target_arch() == "x86_64" {
+            return vec!["-mavx2"];
+        }
+        println!(
+            "cargo:warning=wfa2-sys: the `avx2` feature only affects x86_64 targets; ignoring on {}",
+            target_arch()
+        );
+    }
+    Vec::new()
 }
 
 fn prefixed_file(env_var: &str, package: &str, relative_path: &str) -> Option<PathBuf> {

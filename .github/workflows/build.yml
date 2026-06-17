@@ -11,31 +11,71 @@ env:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - name: default
-            features: ""
-          - name: openmp
-            features: "--features openmp"
-          - name: serde
-            features: "--features serde"
+          - { os: ubuntu-latest,    name: default,      features: "" }
+          - { os: ubuntu-latest,    name: avx2,         features: "--features avx2", expect_avx2: "1" }
+          - { os: ubuntu-24.04-arm, name: linux-arm64,  features: "" }
+          - { os: macos-latest,     name: macos-arm64,  features: "" }
+          - { os: macos-13,         name: macos-x86_64, features: "" }
 
     steps:
       - name: Checkout repository and submodules
         uses: actions/checkout@v6
         with:
           submodules: recursive
-      - name: Install native dependencies
+
+      - name: Install native dependencies (Linux)
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends build-essential clang cmake libclang-dev
+
+      - name: Install native dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install cmake llvm
+          echo "LIBCLANG_PATH=$(brew --prefix llvm)/lib" >> "$GITHUB_ENV"
+
       - name: Check formatting
         if: matrix.name == 'default'
         run: cargo fmt --all --check
+
+      - name: Clippy
+        if: matrix.name == 'default'
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
       - name: Build workspace (${{ matrix.name }})
         run: cargo build --workspace --all-targets --locked ${{ matrix.features }} --verbose
+
+      - name: Verify EXTRA_FLAGS reached the C compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          fm=$(find target -name flags.make -path '*wfa2*' | head -1)
+          if [ -z "$fm" ]; then
+            echo "could not locate WFA2 flags.make under target/" >&2
+            exit 1
+          fi
+          echo "Inspecting $fm"
+          grep -nE '^C_FLAGS' "$fm"
+          grep -q -- '-ftree-vectorize' "$fm" || {
+            echo "EXTRA_FLAGS (-ftree-vectorize) did not reach the compiler" >&2; exit 1; }
+          if [ "$(uname -m)" = "x86_64" ]; then
+            grep -q -- '-msse2' "$fm" || {
+              echo "x86_64 build is missing -msse2" >&2; exit 1; }
+          else
+            if grep -q -- '-msse2' "$fm"; then
+              echo "non-x86_64 build must not contain -msse2" >&2; exit 1
+            fi
+          fi
+          if [ "${{ matrix.expect_avx2 }}" = "1" ]; then
+            grep -q -- '-mavx2' "$fm" || {
+              echo "avx2 feature build is missing -mavx2" >&2; exit 1; }
+          fi
+
       - name: Test workspace (${{ matrix.name }})
         run: cargo test --workspace --all-targets --locked ${{ matrix.features }} --verbose
