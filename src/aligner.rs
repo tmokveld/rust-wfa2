@@ -1142,18 +1142,66 @@ impl WFAlignerBuilder {
 
 struct CigarView<'a> {
     score: i32,
-    begin_offset: i32,
-    end_offset: i32,
     end_v: i32,
     end_h: i32,
     operations: &'a [std::os::raw::c_char],
 }
 
-impl CigarView<'_> {
-    fn active_operation_bytes(&self) -> &[u8] {
-        let operations = &self.operations[self.begin_offset as usize..self.end_offset as usize];
-        // SAFETY: i8/u8 same layout, slice borrowed for 'self
-        unsafe { std::slice::from_raw_parts(operations.as_ptr() as *const u8, operations.len()) }
+fn active_cigar_operations(
+    operations: &[std::os::raw::c_char],
+    begin_offset: i32,
+    end_offset: i32,
+) -> &[std::os::raw::c_char] {
+    let Ok(begin_offset) = usize::try_from(begin_offset) else {
+        return &[];
+    };
+    let Ok(end_offset) = usize::try_from(end_offset) else {
+        return &[];
+    };
+
+    operations.get(begin_offset..end_offset).unwrap_or(&[])
+}
+
+fn operation_bytes(operations: &[std::os::raw::c_char]) -> &[u8] {
+    // SAFETY: c_char is one byte, and the returned slice does not outlive `operations`.
+    unsafe { std::slice::from_raw_parts(operations.as_ptr() as *const u8, operations.len()) }
+}
+
+impl<'a> CigarView<'a> {
+    fn new(
+        score: i32,
+        begin_offset: i32,
+        end_offset: i32,
+        end_v: i32,
+        end_h: i32,
+        operations: &'a [std::os::raw::c_char],
+    ) -> Self {
+        Self {
+            score,
+            end_v,
+            end_h,
+            operations: active_cigar_operations(operations, begin_offset, end_offset),
+        }
+    }
+
+    fn active_operation_bytes(&self) -> &'a [u8] {
+        operation_bytes(self.operations)
+    }
+
+    fn clipped_operations(&self, flank_len: usize) -> &[std::os::raw::c_char] {
+        let Some(end_offset) = self.operations.len().checked_sub(flank_len) else {
+            return &[];
+        };
+
+        if flank_len >= end_offset {
+            return &[];
+        }
+
+        &self.operations[flank_len..end_offset]
+    }
+
+    fn clipped_operation_bytes(&self, flank_len: usize) -> &[u8] {
+        operation_bytes(self.clipped_operations(flank_len))
     }
 
     fn end_position(&self) -> Option<(usize, usize)> {
@@ -1617,34 +1665,27 @@ impl WfaRawHandle {
 
     fn cigar_score_clipped(&self, flank_len: usize) -> i32 {
         let cigar = self.cigar_view().unwrap();
-        let begin_offset = cigar.begin_offset as isize + flank_len as isize;
-        let end_offset =
-            std::cmp::max(begin_offset, cigar.end_offset as isize - flank_len as isize);
+        let operations = cigar.clipped_operations(flank_len);
 
-        if begin_offset >= end_offset {
+        let mut operation_iter = operations.iter().map(|&op| op as u8 as char);
+        let Some(mut last_op) = operation_iter.next() else {
             return 0;
-        }
+        };
 
         let penalties = self.penalties();
         let mut score = 0;
-        let mut op_length = 0;
-        let mut last_op: Option<char> = Some(cigar.operations[begin_offset as usize] as u8 as char);
+        let mut op_length = 1;
 
-        for i in begin_offset..end_offset {
-            let cur_op = cigar.operations[i as usize] as u8 as char;
-            if Some(cur_op) != last_op {
-                if let Some(op) = last_op {
-                    score += Self::clipped_operation_score(op, op_length, &penalties);
-                }
+        for cur_op in operation_iter {
+            if cur_op != last_op {
+                score += Self::clipped_operation_score(last_op, op_length, &penalties);
                 op_length = 0;
             }
-            last_op = Some(cur_op);
+            last_op = cur_op;
             op_length += 1;
         }
 
-        if let Some(op) = last_op {
-            score += Self::clipped_operation_score(op, op_length, &penalties);
-        }
+        score += Self::clipped_operation_score(last_op, op_length, &penalties);
         score
     }
 
@@ -1663,26 +1704,19 @@ impl WfaRawHandle {
         } else {
             unsafe { std::slice::from_raw_parts(cigar.operations, cigar.max_operations as usize) }
         };
-        Some(CigarView {
-            score: cigar.score,
-            begin_offset: cigar.begin_offset,
-            end_offset: cigar.end_offset,
-            end_v: cigar.end_v,
-            end_h: cigar.end_h,
+        Some(CigarView::new(
+            cigar.score,
+            cigar.begin_offset,
+            cigar.end_offset,
+            cigar.end_v,
+            cigar.end_h,
             operations,
-        })
+        ))
     }
 
     fn active_cigar_bytes(&self) -> Option<&[u8]> {
-        let cigar = unsafe { self.cigar_ptr().as_ref() }?;
-        if cigar.operations.is_null() || cigar.begin_offset > cigar.end_offset {
-            return Some(&[]);
-        }
-
-        let cigar_length = (cigar.end_offset - cigar.begin_offset) as usize;
-        let cigar_operations =
-            unsafe { cigar.operations.offset(cigar.begin_offset as isize) as *const u8 };
-        Some(unsafe { std::slice::from_raw_parts(cigar_operations, cigar_length) })
+        let cigar = self.cigar_view()?;
+        Some(operation_bytes(cigar.operations))
     }
 
     fn sequence_lengths(&self) -> (usize, usize) {
@@ -2159,31 +2193,26 @@ impl WFAligner {
         let mut cstr = String::new();
 
         let cigar = self.raw.cigar_view().unwrap();
+        let operations = cigar.clipped_operation_bytes(offset);
 
-        let begin_offset = cigar.begin_offset as usize + offset;
-        let end_offset = cigar.end_offset as usize - offset;
-
-        if begin_offset >= end_offset {
+        let Some((&first_op, remaining_operations)) = operations.split_first() else {
             return cstr;
-        }
-
-        let operations = cigar.operations;
-        let mut last_op = operations[begin_offset];
+        };
+        let mut last_op = first_op;
         let mut last_op_length = 1;
 
-        for i in 1..(end_offset - begin_offset) {
-            let cur_op = operations[begin_offset + i];
+        for &cur_op in remaining_operations {
             if cur_op == last_op {
                 last_op_length += 1;
             } else {
                 cstr.push_str(&format!("{}", last_op_length));
-                cstr.push(last_op as u8 as char);
+                cstr.push(last_op as char);
                 last_op = cur_op;
                 last_op_length = 1;
             }
         }
         cstr.push_str(&format!("{}", last_op_length));
-        cstr.push(last_op as u8 as char);
+        cstr.push(last_op as char);
         cstr
     }
 
@@ -2209,13 +2238,10 @@ impl WFAligner {
         let mut text_alg = String::new();
 
         let cigar = self.raw.cigar_view().unwrap();
-        let operations = cigar.operations;
+        let operations = cigar.clipped_operation_bytes(offset);
 
-        let begin_offset = cigar.begin_offset as isize + offset as isize;
-        let end_offset = cigar.end_offset as isize - offset as isize;
-
-        for i in begin_offset..end_offset {
-            match operations[i as usize] as u8 as char {
+        for &operation in operations {
+            match operation as char {
                 'M' => {
                     if pattern_iter.peek() != text_iter.peek() {
                         ops_alg.push('X');
@@ -3626,6 +3652,25 @@ mod tests {
         // Internal gaps diverge the pattern and text spans.
         assert_eq!(alignment_span_from_ops(b"MMDDMM"), ((0, 6), (0, 4)));
         assert_eq!(alignment_span_from_ops(b"MMIIMM"), ((0, 4), (0, 6)));
+    }
+
+    #[test]
+    fn test_cigar_view_active_operations_reject_invalid_offsets() {
+        let operations = b"MMIDX"
+            .iter()
+            .map(|&operation| operation as c_char)
+            .collect::<Vec<_>>();
+
+        let valid_cigar = CigarView::new(0, 1, 4, 0, 0, &operations);
+        assert_eq!(valid_cigar.active_operation_bytes(), b"MID");
+
+        let invalid_ranges = [(-1, 3), (0, 6), (4, 3)];
+
+        for (begin_offset, end_offset) in invalid_ranges {
+            let cigar = CigarView::new(0, begin_offset, end_offset, 0, 0, &operations);
+
+            assert!(cigar.active_operation_bytes().is_empty());
+        }
     }
 
     #[test]
