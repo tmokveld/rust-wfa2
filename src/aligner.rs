@@ -366,7 +366,7 @@ pub enum DistanceMetric {
     GapAffine2p,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Penalties {
     Indel, // Conceptually: mismatch=inf, indel=1
@@ -391,6 +391,41 @@ pub enum Penalties {
         gap_extension2: i32,
     },
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WfaError {
+    MissingPenaltyModel,
+    InvalidPenalties {
+        penalties: Penalties,
+        reason: &'static str,
+    },
+    IncompatibleHeuristics {
+        distance_metric: DistanceMetric,
+        reason: &'static str,
+    },
+}
+
+impl fmt::Display for WfaError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            WfaError::MissingPenaltyModel => {
+                write!(f, "must set a penalty model before building the aligner")
+            }
+            WfaError::InvalidPenalties { penalties, reason } => {
+                write!(f, "invalid penalties {penalties:?}: {reason}")
+            }
+            WfaError::IncompatibleHeuristics {
+                distance_metric,
+                reason,
+            } => write!(
+                f,
+                "heuristics are incompatible with {distance_metric:?}: {reason}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for WfaError {}
 
 impl From<u32> for DistanceMetric {
     fn from(value: u32) -> Self {
@@ -542,6 +577,144 @@ fn validate_plot_options(resolution_points: i32, align_level: i32) {
     );
 }
 
+fn check_i32(value: i64) -> bool {
+    value >= i32::MIN as i64 && value <= i32::MAX as i64
+}
+
+fn check_adjusted_penalties_fit(penalties: Penalties) -> Result<(), WfaError> {
+    let fits = match penalties {
+        Penalties::Indel | Penalties::Edit => true,
+        Penalties::Linear {
+            match_,
+            mismatch,
+            indel,
+        } if match_ < 0 => {
+            check_i32(2 * mismatch as i64 - 2 * match_ as i64)
+                && check_i32(2 * indel as i64 - match_ as i64)
+        }
+        Penalties::Affine {
+            match_,
+            mismatch,
+            gap_opening,
+            gap_extension,
+        } if match_ < 0 => {
+            check_i32(2 * mismatch as i64 - 2 * match_ as i64)
+                && check_i32(2 * gap_opening as i64)
+                && check_i32(2 * gap_extension as i64 - match_ as i64)
+        }
+        Penalties::Affine2p {
+            match_,
+            mismatch,
+            gap_opening1,
+            gap_extension1,
+            gap_opening2,
+            gap_extension2,
+        } if match_ < 0 => {
+            check_i32(2 * mismatch as i64 - 2 * match_ as i64)
+                && check_i32(2 * gap_opening1 as i64)
+                && check_i32(2 * gap_extension1 as i64 - match_ as i64)
+                && check_i32(2 * gap_opening2 as i64)
+                && check_i32(2 * gap_extension2 as i64 - match_ as i64)
+        }
+        _ => true,
+    };
+
+    if fits {
+        Ok(())
+    } else {
+        Err(WfaError::InvalidPenalties {
+            penalties,
+            reason: "adjusted penalties must fit in i32",
+        })
+    }
+}
+
+fn validate_penalties(penalties: Penalties) -> Result<(), WfaError> {
+    let invalid = |reason| WfaError::InvalidPenalties { penalties, reason };
+
+    match penalties {
+        Penalties::Indel | Penalties::Edit => Ok(()),
+        Penalties::Linear {
+            match_,
+            mismatch,
+            indel,
+        } => {
+            if match_ > 0 {
+                Err(invalid("match score must be negative or zero"))
+            } else if mismatch <= 0 || indel <= 0 {
+                Err(invalid(
+                    "linear penalties require mismatch > 0 and indel > 0",
+                ))
+            } else {
+                check_adjusted_penalties_fit(penalties)
+            }
+        }
+        Penalties::Affine {
+            match_,
+            mismatch,
+            gap_opening,
+            gap_extension,
+        } => {
+            if match_ > 0 {
+                Err(invalid("match score must be negative or zero"))
+            } else if mismatch <= 0 || gap_opening < 0 || gap_extension <= 0 {
+                Err(invalid(
+                    "affine penalties require mismatch > 0, gap_opening >= 0, and gap_extension > 0",
+                ))
+            } else {
+                check_adjusted_penalties_fit(penalties)
+            }
+        }
+        Penalties::Affine2p {
+            match_,
+            mismatch,
+            gap_opening1,
+            gap_extension1,
+            gap_opening2,
+            gap_extension2,
+        } => {
+            if match_ > 0 {
+                return Err(invalid("match score must be negative or zero"));
+            }
+
+            if match_ < 0 {
+                // WFA2 uses two different mismatch formulas, and we mirror both
+                // exactly. The positivity check below uses `2 * mismatch - match`
+                // (wavefront_penalties.c: `(2*X - M) > 0`), while the i32 overflow
+                // check in `check_adjusted_penalties_fit` uses the stored adjusted
+                // value `2 * mismatch - 2 * match`. They are intentionally
+                // different, do not make them the same!
+                let mismatch_adjusted = 2 * mismatch as i64 - match_ as i64;
+                let extension1_adjusted = 2 * gap_extension1 as i64 - match_ as i64;
+                let extension2_adjusted = 2 * gap_extension2 as i64 - match_ as i64;
+                if mismatch_adjusted <= 0
+                    || gap_opening1 < 0
+                    || extension1_adjusted <= 0
+                    || gap_opening2 < 0
+                    || extension2_adjusted <= 0
+                {
+                    Err(invalid(
+                        "affine2p penalties with negative match require (2 * mismatch - match) > 0, gap openings >= 0, and (2 * gap_extension - match) > 0",
+                    ))
+                } else {
+                    check_adjusted_penalties_fit(penalties)
+                }
+            } else if mismatch <= 0
+                || gap_opening1 < 0
+                || gap_extension1 <= 0
+                || gap_opening2 < 0
+                || gap_extension2 <= 0
+            {
+                Err(invalid(
+                    "affine2p penalties require mismatch > 0, gap openings >= 0, and gap extensions > 0",
+                ))
+            } else {
+                Ok(())
+            }
+        }
+    }
+}
+
 #[cfg(unix)]
 fn path_to_cstring(path: &Path) -> io::Result<CString> {
     use std::os::unix::ffi::OsStrExt;
@@ -568,13 +741,27 @@ fn validate_heuristics_for_distance_metric(
     heuristics: &Heuristics,
     distance_metric: DistanceMetric,
 ) {
+    check_heuristics_for_distance_metric(heuristics, distance_metric).unwrap_or_else(|err| {
+        panic!("{err}");
+    });
+}
+
+fn check_heuristics_for_distance_metric(
+    heuristics: &Heuristics,
+    distance_metric: DistanceMetric,
+) -> Result<(), WfaError> {
     if heuristics.drop_heuristic().is_some()
         && matches!(
             distance_metric,
             DistanceMetric::Indel | DistanceMetric::Edit
         )
     {
-        panic!("drop heuristics are not compatible with edit or indel distance metrics");
+        Err(WfaError::IncompatibleHeuristics {
+            distance_metric,
+            reason: "drop heuristics are not compatible with edit or indel distance metrics",
+        })
+    } else {
+        Ok(())
     }
 }
 
@@ -618,6 +805,36 @@ impl WFAttributes {
             max_memory_abort: system.max_memory_abort,
             max_num_threads: system.max_num_threads,
             min_offsets_per_thread: system.min_offsets_per_thread,
+        }
+    }
+
+    fn distance_metric(&self) -> DistanceMetric {
+        DistanceMetric::from(self.inner.distance_metric)
+    }
+
+    fn penalties(&self) -> Penalties {
+        match self.distance_metric() {
+            DistanceMetric::Indel => Penalties::Indel,
+            DistanceMetric::Edit => Penalties::Edit,
+            DistanceMetric::GapLinear => Penalties::Linear {
+                match_: self.inner.linear_penalties.match_,
+                mismatch: self.inner.linear_penalties.mismatch,
+                indel: self.inner.linear_penalties.indel,
+            },
+            DistanceMetric::GapAffine => Penalties::Affine {
+                match_: self.inner.affine_penalties.match_,
+                mismatch: self.inner.affine_penalties.mismatch,
+                gap_opening: self.inner.affine_penalties.gap_opening,
+                gap_extension: self.inner.affine_penalties.gap_extension,
+            },
+            DistanceMetric::GapAffine2p => Penalties::Affine2p {
+                match_: self.inner.affine2p_penalties.match_,
+                mismatch: self.inner.affine2p_penalties.mismatch,
+                gap_opening1: self.inner.affine2p_penalties.gap_opening1,
+                gap_extension1: self.inner.affine2p_penalties.gap_extension1,
+                gap_opening2: self.inner.affine2p_penalties.gap_opening2,
+                gap_extension2: self.inner.affine2p_penalties.gap_extension2,
+            },
         }
     }
 
@@ -877,19 +1094,23 @@ impl WFAlignerBuilder {
         self
     }
 
-    /// Build the WFAligner with the configured settings
-    pub fn build(self) -> WFAligner {
+    /// Build the WFAligner with the configured settings.
+    pub fn build(self) -> Result<WFAligner, WfaError> {
         if !self.penalty_set {
-            panic!("Must set a penalty model before building the aligner");
+            return Err(WfaError::MissingPenaltyModel);
         }
 
-        let mut raw = WfaRawHandle::new(self.attributes);
+        if let Some(heuristics) = self.heuristics {
+            check_heuristics_for_distance_metric(&heuristics, self.attributes.distance_metric())?;
+        }
+
+        let mut raw = WfaRawHandle::new(self.attributes)?;
 
         if let Some(heuristics) = self.heuristics {
             raw.set_heuristics(heuristics);
         }
 
-        WFAligner { raw }
+        Ok(WFAligner { raw })
     }
 }
 
@@ -1002,13 +1223,15 @@ struct WfaRawHandle {
 }
 
 impl WfaRawHandle {
-    fn new(mut attributes: WFAttributes) -> Self {
+    fn new(mut attributes: WFAttributes) -> Result<Self, WfaError> {
+        validate_penalties(attributes.penalties())?;
+
         let inner = unsafe { wfa2::wavefront_aligner_new(&mut attributes.inner) };
-        Self {
+        Ok(Self {
             attributes,
             inner,
             last_sequence_lengths: None,
-        }
+        })
     }
 
     fn alignment_scope(&self) -> AlignmentScope {
@@ -1016,7 +1239,7 @@ impl WfaRawHandle {
     }
 
     fn distance_metric(&self) -> DistanceMetric {
-        DistanceMetric::from(self.attributes.inner.distance_metric)
+        self.attributes.distance_metric()
     }
 
     fn memory_model(&self) -> MemoryModel {
@@ -1033,29 +1256,7 @@ impl WfaRawHandle {
     }
 
     fn penalties(&self) -> Penalties {
-        match self.distance_metric() {
-            DistanceMetric::Indel => Penalties::Indel,
-            DistanceMetric::Edit => Penalties::Edit,
-            DistanceMetric::GapLinear => Penalties::Linear {
-                match_: self.attributes.inner.linear_penalties.match_,
-                mismatch: self.attributes.inner.linear_penalties.mismatch,
-                indel: self.attributes.inner.linear_penalties.indel,
-            },
-            DistanceMetric::GapAffine => Penalties::Affine {
-                match_: self.attributes.inner.affine_penalties.match_,
-                mismatch: self.attributes.inner.affine_penalties.mismatch,
-                gap_opening: self.attributes.inner.affine_penalties.gap_opening,
-                gap_extension: self.attributes.inner.affine_penalties.gap_extension,
-            },
-            DistanceMetric::GapAffine2p => Penalties::Affine2p {
-                match_: self.attributes.inner.affine2p_penalties.match_,
-                mismatch: self.attributes.inner.affine2p_penalties.mismatch,
-                gap_opening1: self.attributes.inner.affine2p_penalties.gap_opening1,
-                gap_extension1: self.attributes.inner.affine2p_penalties.gap_extension1,
-                gap_opening2: self.attributes.inner.affine2p_penalties.gap_opening2,
-                gap_extension2: self.attributes.inner.affine2p_penalties.gap_extension2,
-            },
-        }
+        self.attributes.penalties()
     }
 
     fn heuristics(&self) -> Heuristics {
@@ -1842,6 +2043,15 @@ impl WFAligner {
         self.raw.alignment_span()
     }
 
+    /// Return WFA2's raw CIGAR operations.
+    ///
+    /// These operations follow WFA2's native orientation: they describe how to
+    /// transform the `pattern` argument into the `text` argument. With the
+    /// conventional Rust wrapper naming of `pattern` as query and `text` as
+    /// reference, `I` consumes text/reference and `D` consumes pattern/query.
+    ///
+    /// This is the opposite insertion/deletion orientation from SAM, which
+    /// describes how to transform reference into query.
     pub fn cigar_operations(&self) -> Vec<u8> {
         if self.raw.alignment_scope() == AlignmentScope::Score {
             return Vec::new();
@@ -1854,6 +2064,17 @@ impl WFAligner {
         cigar_str.to_vec()
     }
 
+    /// Return WFA2's CIGAR encoded in BAM/SAM's packed integer format.
+    ///
+    /// The integer packing follows the BAM convention (`len << 4 | op_code`),
+    /// but the operation stream still has WFA2's native orientation: it
+    /// transforms the `pattern` argument into the `text` argument. If callers
+    /// pass `pattern` as query and `text` as reference, `I` and `D` are reversed
+    /// relative to SAM's reference-to-query semantics.
+    ///
+    /// For SAM-compliant reference/query CIGAR semantics, either call the
+    /// aligner with the arguments swapped (`pattern = reference`,
+    /// `text = query`) or swap `I` and `D` after decoding.
     pub fn get_sam_cigar(&self, show_mismatches: bool) -> Vec<u32> {
         if self.raw.alignment_scope() == AlignmentScope::Score {
             panic!("Cannot get SAM CIGAR when AlignmentScope is Score");
@@ -1861,6 +2082,11 @@ impl WFAligner {
         self.raw.sam_cigar(show_mismatches)
     }
 
+    /// Decode BAM/SAM packed CIGAR integers into `(length, op)` pairs.
+    ///
+    /// This only decodes the integer representation. It does not normalize
+    /// WFA2's pattern-to-text operation orientation into SAM's reference-to-query
+    /// orientation.
     pub fn decode_sam_cigar(sam_cigar_buffer: &[u32]) -> Vec<CigarOp> {
         const SAM_CIGAR_LEN_SHIFT: u32 = 4;
         const SAM_CIGAR_OP_MASK: u32 = 0xF;
@@ -2004,6 +2230,7 @@ mod tests {
     use super::*;
     use std::fs;
     use std::path::{Path, PathBuf};
+    use std::process::Command;
     use std::sync::atomic::{AtomicU64, Ordering};
     use WfaOp::*;
 
@@ -2038,11 +2265,57 @@ mod tests {
         assert!(plot.contains("# Heatmap M\n"));
     }
 
+    fn run_invalid_penalty_child(case: &str) {
+        let result = match case {
+            "linear" => WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
+                .linear(0, 1)
+                .build(),
+            "affine" => WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
+                .affine(0, -1, 0)
+                .build(),
+            "affine2p" => WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
+                .affine2p(0, 0, 1, 0, 1)
+                .build(),
+            _ => panic!("unknown invalid penalty case: {case}"),
+        };
+
+        assert!(
+            matches!(result, Err(WfaError::InvalidPenalties { .. })),
+            "expected invalid penalties error for {case}"
+        );
+    }
+
+    #[test]
+    fn test_invalid_penalties_do_not_exit_process() {
+        const CHILD_ENV: &str = "RUST_WFA2_INVALID_PENALTY_CHILD";
+
+        if let Ok(case) = std::env::var(CHILD_ENV) {
+            run_invalid_penalty_child(&case);
+            return;
+        }
+
+        for case in ["linear", "affine", "affine2p"] {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .arg("invalid_penalties_do_not_exit_process")
+                .env(CHILD_ENV, case)
+                .output()
+                .unwrap();
+
+            assert!(
+                output.status.success(),
+                "invalid {case} penalties exited the process: status={:?}, stderr={}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
     #[test]
     fn test_reap_preserves_aligner_for_reuse() {
         let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
             .edit()
-            .build();
+            .build()
+            .unwrap();
 
         aligner.reap();
 
@@ -2073,7 +2346,8 @@ mod tests {
         let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
             .with_plotting(PlotOptions::default())
             .edit()
-            .build();
+            .build()
+            .unwrap();
 
         let result = aligner.align_end_to_end(PATTERN, TEXT);
         assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
@@ -2092,7 +2366,8 @@ mod tests {
         let path = temp_plot_path("disabled");
         let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
             .edit()
-            .build();
+            .build()
+            .unwrap();
         let result = aligner.align_end_to_end(PATTERN, TEXT);
         assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
 
@@ -2106,7 +2381,8 @@ mod tests {
         let aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
             .with_plotting(PlotOptions::default())
             .edit()
-            .build();
+            .build()
+            .unwrap();
 
         let err = aligner.write_plot(&path).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
@@ -2118,7 +2394,8 @@ mod tests {
         let mut aligner = WFAligner::builder(AlignmentScope::Score, MemoryModel::MemoryHigh)
             .with_plotting(PlotOptions::default())
             .edit()
-            .build();
+            .build()
+            .unwrap();
 
         let result = aligner.align_end_to_end(PATTERN, TEXT);
         assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
@@ -2136,7 +2413,8 @@ mod tests {
             WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryUltraLow)
                 .with_plotting(PlotOptions::final_alignment())
                 .affine(1, 5, 1)
-                .build();
+                .build()
+                .unwrap();
 
         let result = aligner.align_end_to_end(PATTERN, TEXT);
         assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
@@ -2150,7 +2428,8 @@ mod tests {
     fn test_aligner_indel() {
         let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
             .indel()
-            .build();
+            .build()
+            .unwrap();
         let result = aligner.align_end_to_end(PATTERN, TEXT);
         assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
         assert_eq!(result.score, 10);
@@ -2170,7 +2449,8 @@ mod tests {
     fn test_aligner_edit() {
         let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
             .edit()
-            .build();
+            .build()
+            .unwrap();
         let result = aligner.align_end_to_end(PATTERN, TEXT);
         assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
         assert_eq!(aligner.score(), 7);
@@ -2186,7 +2466,8 @@ mod tests {
     fn test_aligner_gap_linear() {
         let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
             .linear(6, 2)
-            .build();
+            .build()
+            .unwrap();
         let result = aligner.align_end_to_end(PATTERN, TEXT);
         assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
         assert_eq!(aligner.score(), -20);
@@ -2202,7 +2483,8 @@ mod tests {
     fn test_aligner_gap_affine() {
         let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryLow)
             .affine(6, 4, 2)
-            .build();
+            .build()
+            .unwrap();
         let result = aligner.align_end_to_end(PATTERN, TEXT);
         assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
         assert_eq!(aligner.score(), -40);
@@ -2218,7 +2500,8 @@ mod tests {
     fn test_readme_end_to_end() {
         let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryLow)
             .affine(6, 4, 2)
-            .build();
+            .build()
+            .unwrap();
 
         let pattern = b"TCTTTACTCGCGCGTTGGAGAAATACAATAGT";
         let text = b"TCTATACTGCGCGTTTGGAGAAATAAAATAGT";
@@ -2235,7 +2518,8 @@ mod tests {
     fn test_affine_with_match_long_gap() {
         let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryLow)
             .affine_with_match(-1, 2, 2, 1)
-            .build();
+            .build()
+            .unwrap();
 
         let pattern = b"ATAATA";
         let text = b"ATACATAAAATA";
@@ -2249,7 +2533,8 @@ mod tests {
     fn test_aligner_score_only() {
         let mut aligner = WFAligner::builder(AlignmentScope::Score, MemoryModel::MemoryLow)
             .affine(6, 4, 2)
-            .build();
+            .build()
+            .unwrap();
         let result = aligner.align_end_to_end(PATTERN, TEXT);
         assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
         assert_eq!(aligner.score(), -40);
@@ -2262,7 +2547,8 @@ mod tests {
     fn test_aligner_gap_affine_2pieces() {
         let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
             .affine2p(6, 2, 2, 4, 1)
-            .build();
+            .build()
+            .unwrap();
         let result = aligner.align_end_to_end(PATTERN, TEXT);
         assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
         assert_eq!(aligner.score(), -34);
@@ -2278,7 +2564,8 @@ mod tests {
     fn test_affine2p_with_match_long_gap() {
         let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryLow)
             .affine2p_with_match(-1, 3, 3, 3, 10, 0)
-            .build();
+            .build()
+            .unwrap();
 
         let pattern = b"TCTATAATAGT";
         let text = b"TCTATACTGCGCGTTTGGAGAAATAAAATAGT";
@@ -2292,7 +2579,8 @@ mod tests {
     fn test_affine2p_with_zero_open() {
         let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryLow)
             .affine2p_with_match(-1, 3, 0, 4, 0, 10)
-            .build();
+            .build()
+            .unwrap();
 
         let pattern = b"TCTATAATAGT";
         let text = b"TCTATACTGCGCGTTTGGAGAAATAAAATAGT";
@@ -2313,7 +2601,8 @@ mod tests {
         let mut affine_aligner =
             WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryLow)
                 .affine_with_match(-1, 2, 0, 1)
-                .build();
+                .build()
+                .unwrap();
         let result = affine_aligner.align_end_to_end(pattern, text);
         assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
         assert_eq!(affine_aligner.score(), 0);
@@ -2321,7 +2610,8 @@ mod tests {
         let mut linear_aligner =
             WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryLow)
                 .linear_with_match(-1, 2, 1)
-                .build();
+                .build()
+                .unwrap();
         let result = linear_aligner.align_end_to_end(pattern, text);
         assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
         assert_eq!(linear_aligner.score(), 0);
@@ -2333,7 +2623,8 @@ mod tests {
         let text = b"CCGACTACTACGAAATTTAAGTATAGGCTACTTTCCGTACGTACGTACGT";
         let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
             .affine2p(8, 4, 2, 24, 1)
-            .build();
+            .build()
+            .unwrap();
         let result = aligner.align_ends_free(pattern, 0, 0, text, 0, text.len() as i32);
         assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
         let ((xstart, xend), (ystart, yend)) = aligner.get_alignment_span();
@@ -2350,7 +2641,8 @@ mod tests {
         let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
             .affine2p(8, 4, 2, 24, 1)
             .with_heuristics(Heuristics::none())
-            .build();
+            .build()
+            .unwrap();
         let result = aligner.align_ends_free(pattern, 0, 0, text, 0, text.len() as i32);
         assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
         let ((xstart, xend), (ystart, yend)) = aligner.get_alignment_span();
@@ -2367,7 +2659,8 @@ mod tests {
         let text = b"CCGACTACTACGAAATTTAAGTATAGGCTACTTTCCGTACGTACGTACGT";
         let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
             .affine(6, 4, 2)
-            .build();
+            .build()
+            .unwrap();
         let result = aligner.align_ends_free(pattern, 0, 0, text, 0, text.len() as i32);
         assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
         assert_eq!(aligner.score(), -36);
@@ -2383,7 +2676,8 @@ mod tests {
     fn test_ends_free_with_match_penalties() {
         let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryLow)
             .affine_with_match(-1, 3, 2, 1)
-            .build();
+            .build()
+            .unwrap();
 
         let pattern = b"CGCGTTTGGAGAA";
         let text = b"TCTATACTGCGCGTTTGGAGAAATAAAATAGT";
@@ -2422,7 +2716,8 @@ mod tests {
     fn test_ends_free_shift() {
         let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryLow)
             .affine_with_match(-1, 3, 2, 1)
-            .build();
+            .build()
+            .unwrap();
 
         let pattern = b"TATATTTTTTTTGGAGAAATAAAATA";
         let text = b"TCTATATTTTTTTTTGGAGAAATAAAATAGT";
@@ -2449,7 +2744,8 @@ mod tests {
         let text = b"AATTTCAGTCTGGCTACTTTCACGTACGATGACAGACTCT";
         let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
             .affine(6, 4, 2)
-            .build();
+            .build()
+            .unwrap();
         let result =
             aligner.align_ends_free(pattern, 0, pattern.len() as i32, text, 0, text.len() as i32);
         assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
@@ -2470,7 +2766,8 @@ mod tests {
         let mut ends_free_aligner =
             WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
                 .affine(6, 4, 2)
-                .build();
+                .build()
+                .unwrap();
         let ends_free_result = ends_free_aligner.align_ends_free(
             pattern,
             0,
@@ -2486,7 +2783,8 @@ mod tests {
         let mut extension_aligner =
             WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
                 .affine(6, 4, 2)
-                .build();
+                .build()
+                .unwrap();
         let extension_result = extension_aligner.align_extension(pattern, text);
         assert_eq!(extension_result.status, AlignmentStatus::StatusAlgPartial);
         assert_eq!(extension_aligner.score(), 10);
@@ -2512,7 +2810,8 @@ mod tests {
         // span) rather than reflecting the stale wavefront end position.
         let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
             .affine(6, 4, 2)
-            .build();
+            .build()
+            .unwrap();
 
         let result = aligner.align_extension(b"AAAAAAAA", b"TTTTTTTT");
         assert_eq!(result.status, AlignmentStatus::StatusAlgPartial);
@@ -2551,7 +2850,8 @@ mod tests {
         let text = b"AATTTCAGTCTGGCTACTTTCACGTACGATGACAGACTCT";
         let mut aligner = WFAligner::builder(AlignmentScope::Score, MemoryModel::MemoryHigh)
             .affine(6, 4, 2)
-            .build();
+            .build()
+            .unwrap();
 
         let result = aligner.align_extension(pattern, text);
         assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
@@ -2564,7 +2864,8 @@ mod tests {
         let mut aligner =
             WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryUltraLow)
                 .affine(6, 4, 2)
-                .build();
+                .build()
+                .unwrap();
 
         aligner.align_extension(b"ACGT", b"ACGT");
     }
@@ -2575,7 +2876,8 @@ mod tests {
         let mut aligner =
             WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryUltraLow)
                 .affine(6, 4, 2)
-                .build();
+                .build()
+                .unwrap();
 
         aligner.align_ends_free(b"ACGT", 0, 0, b"ACGT", 0, 1);
     }
@@ -2586,7 +2888,8 @@ mod tests {
         let text = b"AATTTCAGTCTGGCTACTTTCACGTACGATGACAGACTCT";
         let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
             .affine(6, 4, 2)
-            .build();
+            .build()
+            .unwrap();
         let result = aligner.align_ends_free(pattern, 0, 0, text, 0, 0);
         assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
         assert_eq!(aligner.score(), -48);
@@ -2608,7 +2911,8 @@ mod tests {
         let text = b"AAACTTTCACGTACGTGACATATAGCGATCGATGACT";
         let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
             .affine(6, 4, 2)
-            .build();
+            .build()
+            .unwrap();
         let result = aligner.align_ends_free(pattern, 0, 0, text, 0, 0);
         assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
         assert_eq!(aligner.score(), -92);
@@ -2628,7 +2932,8 @@ mod tests {
     fn test_ends_free_span_excludes_trailing_insertions() {
         let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
             .linear_with_match(-1, 1, 1)
-            .build();
+            .build()
+            .unwrap();
 
         let pattern = b"A";
         let text = b"ACG";
@@ -2657,7 +2962,8 @@ mod tests {
 
         let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
             .affine2p(8, 4, 2, 24, 1)
-            .build();
+            .build()
+            .unwrap();
         let result = aligner.align_end_to_end(&pattern, &text);
 
         assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
@@ -2680,7 +2986,8 @@ mod tests {
         let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
             .indel()
             .with_heuristics(Heuristics::none())
-            .build();
+            .build()
+            .unwrap();
         let result = aligner.align_end_to_end(&pattern, &text);
         assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
         assert_eq!(aligner.score(), 12);
@@ -2717,7 +3024,8 @@ mod tests {
         for test in tests {
             let mut aligner = WFAligner::builder(AlignmentScope::Alignment, test.memory_mode)
                 .affine2p(8, 4, 2, 24, 1)
-                .build();
+                .build()
+                .unwrap();
             let result = aligner.align_end_to_end(PATTERN, TEXT);
             assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
             assert_eq!(aligner.score(), expected_score);
@@ -2733,7 +3041,8 @@ mod tests {
     fn test_set_heuristics_replaces_configuration() {
         let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
             .affine(6, 4, 2)
-            .build();
+            .build()
+            .unwrap();
         let combined = Heuristics::new(3)
             .with_adaptive(AdaptiveHeuristic::WfMash {
                 min_wavefront_length: 1,
@@ -2755,7 +3064,8 @@ mod tests {
         let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
             .with_resource_limits(initial_limits)
             .affine(6, 4, 2)
-            .build();
+            .build()
+            .unwrap();
         assert_eq!(aligner.get_resource_limits(), initial_limits);
 
         aligner.set_max_alignment_steps(128);
@@ -2780,7 +3090,8 @@ mod tests {
             .with_max_num_threads(1)
             .with_min_offsets_per_thread(128)
             .affine(6, 4, 2)
-            .build();
+            .build()
+            .unwrap();
         assert_eq!(
             aligner.get_resource_limits(),
             ResourceLimits {
@@ -2798,7 +3109,8 @@ mod tests {
         let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
             .with_max_alignment_steps(1)
             .edit()
-            .build();
+            .build()
+            .unwrap();
 
         let result = aligner.align_end_to_end(PATTERN, TEXT);
         assert_eq!(result.status, AlignmentStatus::StatusMaxStepsReached);
@@ -2812,7 +3124,8 @@ mod tests {
         let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
             .with_max_alignment_steps(1)
             .edit()
-            .build();
+            .build()
+            .unwrap();
 
         let result = aligner.align_end_to_end(PATTERN, TEXT);
         assert_eq!(result.status, AlignmentStatus::StatusMaxStepsReached);
@@ -2825,7 +3138,8 @@ mod tests {
         let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
             .with_max_alignment_steps(1)
             .edit()
-            .build();
+            .build()
+            .unwrap();
 
         let result = aligner.align_end_to_end(PATTERN, TEXT);
         assert_eq!(result.status, AlignmentStatus::StatusMaxStepsReached);
@@ -2837,7 +3151,8 @@ mod tests {
     fn test_get_alignment_rejects_score_scope() {
         let aligner = WFAligner::builder(AlignmentScope::Score, MemoryModel::MemoryHigh)
             .edit()
-            .build();
+            .build()
+            .unwrap();
 
         aligner.get_alignment();
     }
@@ -2847,7 +3162,8 @@ mod tests {
     fn test_get_alignment_span_rejects_score_scope() {
         let aligner = WFAligner::builder(AlignmentScope::Score, MemoryModel::MemoryHigh)
             .edit()
-            .build();
+            .build()
+            .unwrap();
 
         aligner.get_alignment_span();
     }
@@ -2861,7 +3177,8 @@ mod tests {
             WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryUltraLow)
                 .with_heuristics(Heuristics::wfa2_default())
                 .affine2p(8, 4, 2, 24, 1)
-                .build();
+                .build()
+                .unwrap();
 
         // These are valid sequence inputs, the unattainable result is specific to WFA2's
         // BiWFA path when `wf_adaptive(1, 10, 50)` (i.e. `wfa2_default()`).
@@ -2889,17 +3206,20 @@ mod tests {
     fn test_get_penalties() {
         let aligner_edit = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryLow)
             .edit()
-            .build();
+            .build()
+            .unwrap();
         assert_eq!(aligner_edit.get_penalties(), Penalties::Edit);
 
         let aligner_indel = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryLow)
             .indel()
-            .build();
+            .build()
+            .unwrap();
         assert_eq!(aligner_indel.get_penalties(), Penalties::Indel);
 
         let aligner_linear = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryLow)
             .linear(12, 24)
-            .build();
+            .build()
+            .unwrap();
         assert_eq!(
             aligner_linear.get_penalties(),
             Penalties::Linear {
@@ -2911,7 +3231,8 @@ mod tests {
 
         let aligner_affine = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryLow)
             .affine(12, 24, 2)
-            .build();
+            .build()
+            .unwrap();
         assert_eq!(
             aligner_affine.get_penalties(),
             Penalties::Affine {
@@ -2925,7 +3246,8 @@ mod tests {
         let aligner_affine2p =
             WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryLow)
                 .affine2p(12, 24, 2, 48, 1)
-                .build();
+                .build()
+                .unwrap();
         assert_eq!(
             aligner_affine2p.get_penalties(),
             Penalties::Affine2p {
@@ -2941,7 +3263,8 @@ mod tests {
         let aligner_affine_match =
             WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryLow)
                 .affine_with_match(-5, 12, 24, 2)
-                .build();
+                .build()
+                .unwrap();
         assert_eq!(
             aligner_affine_match.get_penalties(),
             Penalties::Affine {
@@ -2957,13 +3280,15 @@ mod tests {
     fn test_builder_pattern() {
         let aligner_edit = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryLow)
             .edit()
-            .build();
+            .build()
+            .unwrap();
         assert_eq!(aligner_edit.get_penalties(), Penalties::Edit);
 
         let aligner_affine = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryLow)
             .affine(12, 24, 2)
             .with_heuristics(Heuristics::wf_adaptive(100, 10, 50))
-            .build();
+            .build()
+            .unwrap();
         assert_eq!(
             aligner_affine.get_penalties(),
             Penalties::Affine {
@@ -2978,7 +3303,8 @@ mod tests {
             WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryLow)
                 .affine(12, 24, 2)
                 .with_heuristics(Heuristics::wf_adaptive(100, 10, 50))
-                .build();
+                .build()
+                .unwrap();
         assert_eq!(
             aligner_affine_heuristic.get_penalties(),
             Penalties::Affine {
@@ -2992,7 +3318,8 @@ mod tests {
         let aligner_affine2p =
             WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryLow)
                 .affine2p(12, 24, 2, 48, 1)
-                .build();
+                .build()
+                .unwrap();
         assert_eq!(
             aligner_affine2p.get_penalties(),
             Penalties::Affine2p {
@@ -3007,7 +3334,8 @@ mod tests {
 
         let aligner_linear = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryLow)
             .linear_with_match(-5, 12, 24)
-            .build();
+            .build()
+            .unwrap();
         assert_eq!(
             aligner_linear.get_penalties(),
             Penalties::Linear {
@@ -3024,7 +3352,8 @@ mod tests {
         let text = b"TCTTTACTCTT";
         let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
             .affine(4, 6, 2)
-            .build();
+            .build()
+            .unwrap();
 
         let result = aligner.align_end_to_end(pattern, text);
         assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
@@ -3071,7 +3400,8 @@ mod tests {
         let mut aligner_diff =
             WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryLow)
                 .affine(4, 6, 2)
-                .build();
+                .build()
+                .unwrap();
         let result_diff = aligner_diff.align_end_to_end(pattern_diff, text_diff);
         assert_eq!(result_diff.status, AlignmentStatus::StatusAlgCompleted);
 
@@ -3111,7 +3441,8 @@ mod tests {
     fn test_get_heuristics_round_trips_combined_categories() {
         let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
             .affine(12, 24, 2)
-            .build();
+            .build()
+            .unwrap();
         assert_eq!(aligner.get_heuristics(), Heuristics::none());
 
         let empty_with_custom_steps = Heuristics::new(10);
@@ -3135,7 +3466,8 @@ mod tests {
             WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
                 .affine(12, 24, 2)
                 .with_heuristics(Heuristics::wf_adaptive(100, 10, 50))
-                .build();
+                .build()
+                .unwrap();
         assert_eq!(
             aligner_with_heuristics.get_heuristics(),
             Heuristics::wf_adaptive(100, 10, 50)
@@ -3167,7 +3499,8 @@ mod tests {
                         max_k: 20,
                     }),
             )
-            .build();
+            .build()
+            .unwrap();
 
         aligner.set_heuristics(Heuristics::none());
         assert!(aligner.get_heuristics().is_none());
@@ -3176,25 +3509,28 @@ mod tests {
 
     #[test]
     fn test_drop_heuristics_reject_edit_and_indel() {
-        assert!(std::panic::catch_unwind(|| {
-            let _ = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
-                .edit()
-                .with_heuristics(Heuristics::xdrop(1, 10))
-                .build();
-        })
-        .is_err());
+        let edit_result = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
+            .edit()
+            .with_heuristics(Heuristics::xdrop(1, 10))
+            .build();
+        assert!(matches!(
+            edit_result,
+            Err(WfaError::IncompatibleHeuristics { .. })
+        ));
 
-        assert!(std::panic::catch_unwind(|| {
-            let _ = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
-                .indel()
-                .with_heuristics(Heuristics::zdrop(1, 10))
-                .build();
-        })
-        .is_err());
+        let indel_result = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
+            .indel()
+            .with_heuristics(Heuristics::zdrop(1, 10))
+            .build();
+        assert!(matches!(
+            indel_result,
+            Err(WfaError::IncompatibleHeuristics { .. })
+        ));
 
         let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
             .edit()
-            .build();
+            .build()
+            .unwrap();
         assert!(std::panic::catch_unwind(move || {
             aligner.set_heuristics(Heuristics::xdrop(1, 10));
         })
@@ -3217,7 +3553,8 @@ mod tests {
                         max_k: 100,
                     }),
             )
-            .build();
+            .build()
+            .unwrap();
 
         let result = aligner.align_end_to_end(PATTERN, TEXT);
         assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
@@ -3230,7 +3567,8 @@ mod tests {
         let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
             .affine_with_match(-1, 4, 6, 2)
             .with_heuristics(Heuristics::zdrop(1, 0))
-            .build();
+            .build()
+            .unwrap();
 
         let result = aligner.align_end_to_end(pattern, text);
         assert_eq!(result.status, AlignmentStatus::StatusAlgPartial);
@@ -3270,7 +3608,8 @@ mod tests {
         let text = b"AACTAAGTGTCGGTGGCTACTATATATCAGGTCCT";
         let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
             .affine(1, 5, 1)
-            .build();
+            .build()
+            .unwrap();
         let result = aligner.align_end_to_end(pattern, text);
         assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
 
@@ -3307,7 +3646,8 @@ mod tests {
         let mut aligner =
             WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryUltraLow)
                 .affine(1, 5, 1)
-                .build();
+                .build()
+                .unwrap();
         let result = aligner.align_end_to_end(pattern, text);
         assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
 
@@ -3361,7 +3701,8 @@ mod tests {
         let mut aligner =
             WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryUltraLow)
                 .affine(1, 5, 1)
-                .build();
+                .build()
+                .unwrap();
         let result = aligner.align_end_to_end(&pattern, &text);
         assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
 
@@ -3384,7 +3725,8 @@ mod tests {
         let text = b"GGGGGGGGGGAGTGTCAATGGCTACGGGGGGGGGG";
         let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
             .affine(1, 5, 1)
-            .build();
+            .build()
+            .unwrap();
         let result =
             aligner.align_ends_free(pattern, 0, 0, text, text.len() as i32, text.len() as i32);
         assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
@@ -3458,7 +3800,8 @@ mod tests {
     fn test_runtime_set_max_alignment_steps_validates() {
         let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
             .edit()
-            .build();
+            .build()
+            .unwrap();
         aligner.set_max_alignment_steps(0);
     }
 
@@ -3548,9 +3891,11 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "Must set a penalty model before building the aligner")]
     fn test_builder_rejects_missing_penalty_model() {
-        let _ = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh).build();
+        match WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh).build() {
+            Err(err) => assert_eq!(err, WfaError::MissingPenaltyModel),
+            Ok(_) => panic!("expected missing penalty model error"),
+        }
     }
 
     #[test]
@@ -3608,7 +3953,8 @@ mod tests {
     fn test_cigar_score_clipped_rejects_score_scope() {
         let aligner = WFAligner::builder(AlignmentScope::Score, MemoryModel::MemoryHigh)
             .edit()
-            .build();
+            .build()
+            .unwrap();
         aligner.cigar_score_clipped(0);
     }
 
@@ -3617,7 +3963,8 @@ mod tests {
     fn test_count_matches_rejects_score_scope() {
         let aligner = WFAligner::builder(AlignmentScope::Score, MemoryModel::MemoryHigh)
             .edit()
-            .build();
+            .build()
+            .unwrap();
         aligner.count_matches();
     }
 
@@ -3626,7 +3973,8 @@ mod tests {
     fn test_get_sam_cigar_rejects_score_scope() {
         let aligner = WFAligner::builder(AlignmentScope::Score, MemoryModel::MemoryHigh)
             .edit()
-            .build();
+            .build()
+            .unwrap();
         aligner.get_sam_cigar(true);
     }
 
@@ -3635,7 +3983,8 @@ mod tests {
     fn test_cigar_score_rejects_score_scope() {
         let mut aligner = WFAligner::builder(AlignmentScope::Score, MemoryModel::MemoryHigh)
             .edit()
-            .build();
+            .build()
+            .unwrap();
         aligner.cigar_score();
     }
 
@@ -3645,7 +3994,8 @@ mod tests {
         // Vec (not panic) when scope is Score.
         let mut aligner = WFAligner::builder(AlignmentScope::Score, MemoryModel::MemoryHigh)
             .edit()
-            .build();
+            .build()
+            .unwrap();
         let result = aligner.align_end_to_end(PATTERN, TEXT);
         assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
         assert!(aligner.cigar_operations().is_empty());
@@ -3736,7 +4086,8 @@ mod tests {
         let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
             .with_max_memory(1024, 1024)
             .affine(6, 4, 2)
-            .build();
+            .build()
+            .unwrap();
 
         let result = aligner.align_end_to_end(&pattern, &text);
         assert_eq!(result.status, AlignmentStatus::StatusOOM);
@@ -3749,7 +4100,8 @@ mod tests {
         let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
             .with_max_memory(1024, 1024)
             .affine(6, 4, 2)
-            .build();
+            .build()
+            .unwrap();
 
         let result = aligner.align_end_to_end(&pattern, &text);
         assert_eq!(result.status, AlignmentStatus::StatusOOM);
@@ -3761,7 +4113,8 @@ mod tests {
         let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
             .with_plotting(PlotOptions::default())
             .edit()
-            .build();
+            .build()
+            .unwrap();
         let result = aligner.align_end_to_end(PATTERN, TEXT);
         assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
 
@@ -3773,7 +4126,8 @@ mod tests {
     fn test_align_empty_pattern_against_text() {
         let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
             .affine(6, 4, 2)
-            .build();
+            .build()
+            .unwrap();
 
         let text = b"ACGT";
         let result = aligner.align_end_to_end(b"", text);
@@ -3791,7 +4145,8 @@ mod tests {
     fn test_align_both_empty() {
         let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
             .affine(6, 4, 2)
-            .build();
+            .build()
+            .unwrap();
 
         let result = aligner.align_end_to_end(b"", b"");
         assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
@@ -3812,7 +4167,8 @@ mod tests {
 
         let mut global = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryUltraLow)
             .affine(1, 5, 1)
-            .build();
+            .build()
+            .unwrap();
         let global_result = global.align_end_to_end(pattern, text);
         assert_eq!(global_result.status, AlignmentStatus::StatusAlgCompleted);
         let global_score = global.score();
@@ -3822,7 +4178,8 @@ mod tests {
         let mut ends_free =
             WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryUltraLow)
                 .affine(1, 5, 1)
-                .build();
+                .build()
+                .unwrap();
         let ends_free_result = ends_free.align_ends_free(pattern, 0, 0, text, 0, 0);
         assert_eq!(ends_free_result.status, AlignmentStatus::StatusAlgCompleted);
         assert_eq!(ends_free.score(), global_score);
@@ -3832,7 +4189,8 @@ mod tests {
     fn test_cigar_score_clipped_flank_exceeding_alignment_is_zero() {
         let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryLow)
             .affine2p_with_match(-1, 3, 3, 3, 10, 0)
-            .build();
+            .build()
+            .unwrap();
 
         let pattern = b"TCTATAATAGT";
         let text = b"TCTATACTGCGCGTTTGGAGAAATAAAATAGT";
@@ -3852,7 +4210,8 @@ mod tests {
     fn test_cigar_score_clipped_affine2p_selects_cheaper_gap_piece() {
         let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryLow)
             .affine2p_with_match(-1, 3, 3, 3, 10, 0)
-            .build();
+            .build()
+            .unwrap();
 
         let pattern = b"TCTATAATAGT";
         let text = b"TCTATACTGCGCGTTTGGAGAAATAAAATAGT";
@@ -3873,7 +4232,8 @@ mod tests {
     fn test_count_matches_direct() {
         let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
             .affine(4, 6, 2)
-            .build();
+            .build()
+            .unwrap();
 
         let identical = b"TCTTTACTCTT";
         let result = aligner.align_end_to_end(identical, identical);
@@ -3897,7 +4257,8 @@ mod tests {
                 WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
                     .affine(6, 4, 2)
                     .with_heuristics(heuristics)
-                    .build();
+                    .build()
+                    .unwrap();
             let result = aligner.align_end_to_end(PATTERN, TEXT);
             assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
         }
@@ -3950,7 +4311,8 @@ mod tests {
     fn test_serde_round_trips_result_types() {
         let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
             .affine(6, 4, 2)
-            .build();
+            .build()
+            .unwrap();
         let result = aligner.align_end_to_end(PATTERN, TEXT);
         assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
 

@@ -48,7 +48,7 @@ use rust_wfa2::aligner::{AlignmentScope, AlignmentStatus, MemoryModel, WFAligner
 
 let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryLow)
     .affine(6, 4, 2)
-    .build();
+    .build().unwrap();
 
 let pattern = b"TCTTTACTCGCGCGTTGGAGAAATACAATAGT";
 let text = b"TCTATACTGCGCGTTTGGAGAAATAAAATAGT";
@@ -60,6 +60,18 @@ assert_eq!(
     b"MMMXMMMMDMMMMMMMIMMMMMMMMMXMMMMMM"
 );
 ```
+
+### CIGAR orientation and SAM
+
+WFA2 CIGAR operations describe how to transform the `pattern` argument into the
+`text` argument. In this Rust wrapper, `pattern` is usually the query and `text`
+is usually the reference, so raw WFA2 operations use the opposite insertion and
+deletion orientation from SAM's reference-to-query CIGAR semantics.
+
+`get_sam_cigar()` uses BAM/SAM's packed integer encoding, but it does not change
+that WFA2 operation orientation. For SAM-compliant reference/query CIGAR output,
+either call the aligner with `pattern = reference` and `text = query`, or swap
+`I` and `D` after decoding.
 
 ### WFA2 plot dumps
 
@@ -73,7 +85,7 @@ use rust_wfa2::aligner::{AlignmentScope, AlignmentStatus, MemoryModel, PlotOptio
 let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
     .with_plotting(PlotOptions::default())
     .affine(6, 4, 2)
-    .build();
+    .build().unwrap();
 
 let result = aligner.align_end_to_end(
     b"TCTTTACTCGCGCGTTGGAGAAATACAATAGT",
@@ -106,5 +118,5 @@ let heuristics = Heuristics::new(10)
 let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryLow)
     .affine(6, 4, 2)
     .with_heuristics(heuristics)
-    .build();
+    .build().unwrap();
 ```
