@@ -1,9 +1,12 @@
 use crate::wfa2;
+use std::any::Any;
 use std::ffi::CString;
 use std::fmt;
 use std::io;
-use std::os::raw::c_char;
+use std::os::raw::{c_char, c_int, c_void};
+use std::panic::{self, AssertUnwindSafe};
 use std::path::Path;
+use std::sync::Mutex;
 
 // WFA2 defines DPMATRIX_DIAGONAL_NULL as INT_MAX. Bindgen does not emit
 // that macro consistently across libclang/platform combinations.
@@ -1313,6 +1316,75 @@ fn extension_alignment_span_from_ops(raw_operations: &[u8]) -> ((usize, usize), 
     ((0, pattern_end), (0, text_end))
 }
 
+struct LambdaMatcherContext<'a, F>
+where
+    F: Fn(usize, usize) -> bool + Sync,
+{
+    matcher: &'a F,
+    panic_payload: Mutex<Option<Box<dyn Any + Send + 'static>>>,
+}
+
+impl<'a, F> LambdaMatcherContext<'a, F>
+where
+    F: Fn(usize, usize) -> bool + Sync,
+{
+    fn new(matcher: &'a F) -> Self {
+        Self {
+            matcher,
+            panic_payload: Mutex::new(None),
+        }
+    }
+
+    fn record_panic(&self, payload: Box<dyn Any + Send + 'static>) {
+        let Ok(mut stored_payload) = self.panic_payload.lock() else {
+            return;
+        };
+
+        if stored_payload.is_none() {
+            *stored_payload = Some(payload);
+        }
+    }
+
+    fn take_panic(&self) -> Option<Box<dyn Any + Send + 'static>> {
+        self.panic_payload
+            .lock()
+            .ok()
+            .and_then(|mut stored_payload| stored_payload.take())
+    }
+}
+
+unsafe extern "C" fn lambda_match_trampoline<F>(
+    pattern_pos: c_int,
+    text_pos: c_int,
+    arguments: *mut c_void,
+) -> c_int
+where
+    F: Fn(usize, usize) -> bool + Sync,
+{
+    if arguments.is_null() {
+        return 0;
+    }
+
+    let Ok(pattern_pos) = usize::try_from(pattern_pos) else {
+        return 0;
+    };
+    let Ok(text_pos) = usize::try_from(text_pos) else {
+        return 0;
+    };
+
+    let context = unsafe { &*(arguments as *const LambdaMatcherContext<'_, F>) };
+    match panic::catch_unwind(AssertUnwindSafe(|| {
+        (context.matcher)(pattern_pos, text_pos)
+    })) {
+        Ok(true) => 1,
+        Ok(false) => 0,
+        Err(payload) => {
+            context.record_panic(payload);
+            0
+        }
+    }
+}
+
 struct WfaRawHandle {
     attributes: WFAttributes,
     inner: *mut wfa2::wavefront_aligner_t,
@@ -1448,6 +1520,19 @@ impl WfaRawHandle {
         self.align(pattern, text)
     }
 
+    fn align_end_to_end_lambda<F>(
+        &mut self,
+        pattern_len: usize,
+        text_len: usize,
+        matcher: &F,
+    ) -> AlignmentResult
+    where
+        F: Fn(usize, usize) -> bool + Sync,
+    {
+        self.set_alignment_end_to_end();
+        self.align_lambda(pattern_len, text_len, matcher)
+    }
+
     fn align_ends_free(
         &mut self,
         pattern: &[u8],
@@ -1479,6 +1564,42 @@ impl WfaRawHandle {
         self.align(pattern, text)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn align_ends_free_lambda<F>(
+        &mut self,
+        pattern_len: usize,
+        pattern_begin_free: i32,
+        pattern_end_free: i32,
+        text_len: usize,
+        text_begin_free: i32,
+        text_end_free: i32,
+        matcher: &F,
+    ) -> AlignmentResult
+    where
+        F: Fn(usize, usize) -> bool + Sync,
+    {
+        if self.memory_model() == MemoryModel::MemoryUltraLow
+            && [
+                pattern_begin_free,
+                pattern_end_free,
+                text_begin_free,
+                text_end_free,
+            ]
+            .iter()
+            .any(|&free_ends| free_ends != 0)
+        {
+            panic!("Ends-free alignment is not supported with MemoryUltraLow");
+        }
+
+        self.set_alignment_ends_free(
+            pattern_begin_free,
+            pattern_end_free,
+            text_begin_free,
+            text_end_free,
+        );
+        self.align_lambda(pattern_len, text_len, matcher)
+    }
+
     fn align_extension(&mut self, pattern: &[u8], text: &[u8]) -> AlignmentResult {
         if self.memory_model() == MemoryModel::MemoryUltraLow {
             panic!("Extension alignment is not supported with MemoryUltraLow");
@@ -1486,6 +1607,23 @@ impl WfaRawHandle {
 
         self.set_alignment_extension();
         self.align(pattern, text)
+    }
+
+    fn align_extension_lambda<F>(
+        &mut self,
+        pattern_len: usize,
+        text_len: usize,
+        matcher: &F,
+    ) -> AlignmentResult
+    where
+        F: Fn(usize, usize) -> bool + Sync,
+    {
+        if self.memory_model() == MemoryModel::MemoryUltraLow {
+            panic!("Extension alignment is not supported with MemoryUltraLow");
+        }
+
+        self.set_alignment_extension();
+        self.align_lambda(pattern_len, text_len, matcher)
     }
 
     fn reap(&mut self) {
@@ -1513,6 +1651,37 @@ impl WfaRawHandle {
                 text.len() as i32,
             )
         };
+        let result = self.alignment_result();
+        debug_assert_eq!(result.status, AlignmentStatus::from(raw_status));
+        result
+    }
+
+    fn align_lambda<F>(
+        &mut self,
+        pattern_len: usize,
+        text_len: usize,
+        matcher: &F,
+    ) -> AlignmentResult
+    where
+        F: Fn(usize, usize) -> bool + Sync,
+    {
+        self.last_sequence_lengths = Some((pattern_len, text_len));
+
+        let context = LambdaMatcherContext::new(matcher);
+        let raw_status = unsafe {
+            wfa2::wavefront_align_lambda(
+                self.inner,
+                Some(lambda_match_trampoline::<F>),
+                &context as *const LambdaMatcherContext<'_, F> as *mut c_void,
+                pattern_len as i32,
+                text_len as i32,
+            )
+        };
+
+        if let Some(payload) = context.take_panic() {
+            panic::resume_unwind(payload);
+        }
+
         let result = self.alignment_result();
         debug_assert_eq!(result.status, AlignmentStatus::from(raw_status));
         result
@@ -1976,7 +2145,6 @@ impl Drop for WfaRawHandle {
     }
 }
 
-// TODO: Unify different Cigar wrappers
 /// Represents a single operation: (length, op).
 pub type CigarOp = (usize, char);
 
@@ -2004,10 +2172,47 @@ impl WFAligner {
 }
 
 impl WFAligner {
+    /// Align byte-slice WFA pattern and WFA text inputs end to end.
+    ///
+    /// Both inputs are aligned globally over their full lengths. The returned
+    /// [`AlignmentResult`] reports WFA2's status and wavefront score snapshot;
+    /// with [`AlignmentScope::Alignment`], CIGAR, packed CIGAR, SAM-oriented
+    /// CIGAR, match count, clipped score, and alignment span can be read from
+    /// the same aligner after this call.
     pub fn align_end_to_end(&mut self, pattern: &[u8], text: &[u8]) -> AlignmentResult {
         self.raw.align_end_to_end(pattern, text)
     }
 
+    /// Align WFA pattern/text coordinate spaces with a Rust matcher closure.
+    ///
+    /// `pattern_len` and `text_len` define the half-open WFA pattern/text index
+    /// spaces. `matcher` receives zero-based `(pattern_pos, text_pos)`
+    /// coordinates and returns whether those positions match. The closure is
+    /// borrowed only for this call, but it must be `Sync` because WFA2 may call
+    /// it from multiple worker threads when native parallelism is enabled.
+    ///
+    /// Panics inside the matcher are caught at the C callback boundary and
+    /// resumed after WFA2 returns.
+    pub fn align_end_to_end_lambda<F>(
+        &mut self,
+        pattern_len: usize,
+        text_len: usize,
+        matcher: F,
+    ) -> AlignmentResult
+    where
+        F: Fn(usize, usize) -> bool + Sync,
+    {
+        self.raw
+            .align_end_to_end_lambda(pattern_len, text_len, &matcher)
+    }
+
+    /// Align byte-slice WFA pattern and WFA text inputs with free ends.
+    ///
+    /// The free-end counts are expressed on the WFA pattern/text axes and are
+    /// forwarded to WFA2's ends-free alignment form. With
+    /// [`AlignmentScope::Alignment`], the active CIGAR and alignment span can
+    /// be read after this call. `MemoryUltraLow` is rejected when any free-end
+    /// count is nonzero, matching WFA2's unsupported BiWFA ends-free path.
     pub fn align_ends_free(
         &mut self,
         pattern: &[u8],
@@ -2027,14 +2232,65 @@ impl WFAligner {
         )
     }
 
-    /// Align a right extension using WFA2's extension mode.
+    /// Align WFA pattern/text coordinate spaces with free ends.
     ///
-    /// With `AlignmentScope::Alignment`, WFA2 trims the active CIGAR to the
-    /// maximal-scoring extension and can return `StatusAlgPartial`.
-    /// `MemoryUltraLow` is rejected because WFA2's BiWFA path exits the process
-    /// for extension alignments.
+    /// Free-end counts use the same WFA pattern/text axes as
+    /// [`WFAligner::align_ends_free`] and otherwise follow the same native
+    /// handling. `MemoryUltraLow` is rejected for nonzero free ends, matching
+    /// byte-slice ends-free alignment.
+    #[allow(clippy::too_many_arguments)]
+    pub fn align_ends_free_lambda<F>(
+        &mut self,
+        pattern_len: usize,
+        pattern_begin_free: i32,
+        pattern_end_free: i32,
+        text_len: usize,
+        text_begin_free: i32,
+        text_end_free: i32,
+        matcher: F,
+    ) -> AlignmentResult
+    where
+        F: Fn(usize, usize) -> bool + Sync,
+    {
+        self.raw.align_ends_free_lambda(
+            pattern_len,
+            pattern_begin_free,
+            pattern_end_free,
+            text_len,
+            text_begin_free,
+            text_end_free,
+            &matcher,
+        )
+    }
+
+    /// Align a right extension of byte-slice WFA pattern and WFA text inputs.
+    ///
+    /// WFA2 extension mode anchors the alignment at the origin and trims the
+    /// active CIGAR to the maximal-scoring prefix. With
+    /// [`AlignmentScope::Alignment`], extension alignments can return
+    /// [`AlignmentStatus::StatusAlgPartial`], and the span is derived from the
+    /// active CIGAR. `MemoryUltraLow` is rejected because WFA2's BiWFA path
+    /// exits the process for extension alignments.
     pub fn align_extension(&mut self, pattern: &[u8], text: &[u8]) -> AlignmentResult {
         self.raw.align_extension(pattern, text)
+    }
+
+    /// Align a right extension over WFA pattern/text coordinate spaces.
+    ///
+    /// The matcher contract is the same as
+    /// [`WFAligner::align_end_to_end_lambda`]. `MemoryUltraLow` is rejected
+    /// because WFA2's BiWFA path exits the process for extension alignments.
+    pub fn align_extension_lambda<F>(
+        &mut self,
+        pattern_len: usize,
+        text_len: usize,
+        matcher: F,
+    ) -> AlignmentResult
+    where
+        F: Fn(usize, usize) -> bool + Sync,
+    {
+        self.raw
+            .align_extension_lambda(pattern_len, text_len, &matcher)
     }
 
     /// Reclaim reusable wavefront memory without destroying the aligner.
@@ -2567,6 +2823,130 @@ mod tests {
     }
 
     #[test]
+    fn test_align_end_to_end_lambda_matches_byte_alignment_outputs() {
+        let mut byte_aligner =
+            WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
+                .affine(1, 5, 1)
+                .build()
+                .unwrap();
+        let byte_result = byte_aligner.align_end_to_end(PATTERN, TEXT);
+        assert_eq!(byte_result.status, AlignmentStatus::StatusAlgCompleted);
+
+        let byte_score = byte_aligner.score();
+        let byte_wfa_cigar = byte_aligner.wfa_cigar_bytes();
+        let byte_sam_cigar = byte_aligner.sam_cigar_bytes();
+        let byte_wfa_packed = byte_aligner.wfa_packed_cigar(true);
+        let byte_sam_packed = byte_aligner.sam_packed_cigar(true);
+        let byte_match_count = byte_aligner.count_matches();
+        let byte_clipped_score = byte_aligner.cigar_score_clipped(0);
+        let byte_cigar_score = byte_aligner.cigar_score();
+        let byte_span = byte_aligner.get_alignment_span();
+        let byte_alignment = byte_aligner.get_alignment();
+
+        let matcher_calls = AtomicU64::new(0);
+        let mut lambda_aligner =
+            WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
+                .affine(1, 5, 1)
+                .build()
+                .unwrap();
+        let lambda_result = lambda_aligner.align_end_to_end_lambda(
+            PATTERN.len(),
+            TEXT.len(),
+            |pattern_pos, text_pos| {
+                matcher_calls.fetch_add(1, Ordering::Relaxed);
+                PATTERN[pattern_pos] == TEXT[text_pos]
+            },
+        );
+
+        assert!(matcher_calls.load(Ordering::Relaxed) > 0);
+        assert_eq!(lambda_result.status, byte_result.status);
+        assert_eq!(lambda_result.score, byte_result.score);
+        assert_eq!(lambda_aligner.score(), byte_score);
+        assert_eq!(lambda_aligner.wfa_cigar_bytes(), byte_wfa_cigar);
+        assert_eq!(lambda_aligner.sam_cigar_bytes(), byte_sam_cigar);
+        assert_eq!(lambda_aligner.wfa_packed_cigar(true), byte_wfa_packed);
+        assert_eq!(lambda_aligner.sam_packed_cigar(true), byte_sam_packed);
+        assert_eq!(lambda_aligner.count_matches(), byte_match_count);
+        assert_eq!(lambda_aligner.cigar_score_clipped(0), byte_clipped_score);
+        assert_eq!(lambda_aligner.cigar_score(), byte_cigar_score);
+        assert_eq!(lambda_aligner.get_alignment_span(), byte_span);
+        assert_eq!(lambda_aligner.get_alignment(), byte_alignment);
+    }
+
+    #[test]
+    fn test_align_end_to_end_lambda_supports_score_scope() {
+        let mut byte_aligner = WFAligner::builder(AlignmentScope::Score, MemoryModel::MemoryLow)
+            .affine(6, 4, 2)
+            .build()
+            .unwrap();
+        let byte_result = byte_aligner.align_end_to_end(PATTERN, TEXT);
+        assert_eq!(byte_result.status, AlignmentStatus::StatusAlgCompleted);
+
+        let mut lambda_aligner = WFAligner::builder(AlignmentScope::Score, MemoryModel::MemoryLow)
+            .affine(6, 4, 2)
+            .build()
+            .unwrap();
+        let lambda_result = lambda_aligner.align_end_to_end_lambda(
+            PATTERN.len(),
+            TEXT.len(),
+            |pattern_pos, text_pos| PATTERN[pattern_pos] == TEXT[text_pos],
+        );
+
+        assert_eq!(lambda_result.status, byte_result.status);
+        assert_eq!(lambda_result.score, byte_result.score);
+        assert_eq!(lambda_aligner.score(), byte_aligner.score());
+        assert_eq!(lambda_aligner.cigar_string(None), "");
+    }
+
+    #[test]
+    fn test_align_end_to_end_lambda_resumes_matcher_panic() {
+        let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
+            .edit()
+            .build()
+            .unwrap();
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            aligner.align_end_to_end_lambda(4, 4, |_, _| -> bool {
+                panic!("lambda matcher panic");
+            });
+        }));
+
+        let payload = result.expect_err("expected matcher panic to resume after WFA2 returns");
+        let message = payload
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| payload.downcast_ref::<String>().map(String::as_str));
+        assert_eq!(message, Some("lambda matcher panic"));
+    }
+
+    #[test]
+    fn test_align_end_to_end_lambda_ultralow_reports_original_lengths() {
+        let mut aligner =
+            WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryUltraLow)
+                .affine(1, 5, 1)
+                .build()
+                .unwrap();
+
+        let result =
+            aligner.align_end_to_end_lambda(PATTERN.len(), TEXT.len(), |pattern_pos, text_pos| {
+                PATTERN[pattern_pos] == TEXT[text_pos]
+            });
+        assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
+
+        let alignment = aligner.get_alignment();
+        assert_eq!(alignment.xlen, PATTERN.len());
+        assert_eq!(alignment.ylen, TEXT.len());
+        assert_eq!(alignment.xstart, 0);
+        assert_eq!(alignment.xend, PATTERN.len());
+        assert_eq!(alignment.ystart, 0);
+        assert_eq!(alignment.yend, TEXT.len());
+        assert_eq!(
+            aligner.get_alignment_span(),
+            ((0, PATTERN.len()), (0, TEXT.len()))
+        );
+    }
+
+    #[test]
     fn test_aligner_gap_linear() {
         let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
             .linear(6, 2)
@@ -2777,6 +3157,113 @@ mod tests {
     }
 
     #[test]
+    fn test_align_ends_free_lambda_matches_byte_alignment_outputs() {
+        let pattern = b"AATTTAAGTCTAGGCTACTTTC";
+        let text = b"CCGACTACTACGAAATTTAAGTATAGGCTACTTTCCGTACGTACGTACGT";
+        let text_end_free = text.len() as i32;
+
+        let mut byte_aligner =
+            WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
+                .affine(6, 4, 2)
+                .build()
+                .unwrap();
+        let byte_result = byte_aligner.align_ends_free(pattern, 0, 0, text, 0, text_end_free);
+        assert_eq!(byte_result.status, AlignmentStatus::StatusAlgCompleted);
+
+        let byte_score = byte_aligner.score();
+        let byte_wfa_cigar = byte_aligner.wfa_cigar_bytes();
+        let byte_sam_cigar = byte_aligner.sam_cigar_bytes();
+        let byte_wfa_packed = byte_aligner.wfa_packed_cigar(true);
+        let byte_sam_packed = byte_aligner.sam_packed_cigar(true);
+        let byte_span = byte_aligner.get_alignment_span();
+        let byte_alignment = byte_aligner.get_alignment();
+
+        let mut lambda_aligner =
+            WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
+                .affine(6, 4, 2)
+                .build()
+                .unwrap();
+        let lambda_result = lambda_aligner.align_ends_free_lambda(
+            pattern.len(),
+            0,
+            0,
+            text.len(),
+            0,
+            text_end_free,
+            |pattern_pos, text_pos| pattern[pattern_pos] == text[text_pos],
+        );
+
+        assert_eq!(lambda_result.status, byte_result.status);
+        assert_eq!(lambda_result.score, byte_result.score);
+        assert_eq!(lambda_aligner.score(), byte_score);
+        assert_eq!(lambda_aligner.wfa_cigar_bytes(), byte_wfa_cigar);
+        assert_eq!(lambda_aligner.sam_cigar_bytes(), byte_sam_cigar);
+        assert_eq!(lambda_aligner.wfa_packed_cigar(true), byte_wfa_packed);
+        assert_eq!(lambda_aligner.sam_packed_cigar(true), byte_sam_packed);
+        assert_eq!(lambda_aligner.get_alignment_span(), byte_span);
+        assert_eq!(lambda_aligner.get_alignment(), byte_alignment);
+    }
+
+    #[test]
+    fn test_align_ends_free_lambda_rejects_ultralow_nonzero_free_ends() {
+        let matcher_calls = AtomicU64::new(0);
+        let mut aligner =
+            WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryUltraLow)
+                .edit()
+                .build()
+                .unwrap();
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            aligner.align_ends_free_lambda(4, 0, 1, 4, 0, 0, |_, _| {
+                matcher_calls.fetch_add(1, Ordering::Relaxed);
+                true
+            });
+        }));
+
+        let payload = result.expect_err("expected MemoryUltraLow ends-free lambda rejection");
+        let message = payload
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| payload.downcast_ref::<String>().map(String::as_str));
+        assert_eq!(
+            message,
+            Some("Ends-free alignment is not supported with MemoryUltraLow")
+        );
+        assert_eq!(matcher_calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_align_ends_free_lambda_ultralow_all_zero_matches_global_lambda() {
+        let mut global = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryUltraLow)
+            .affine(1, 5, 1)
+            .build()
+            .unwrap();
+        let global_result =
+            global.align_end_to_end_lambda(PATTERN.len(), TEXT.len(), |pattern_pos, text_pos| {
+                PATTERN[pattern_pos] == TEXT[text_pos]
+            });
+        assert_eq!(global_result.status, AlignmentStatus::StatusAlgCompleted);
+        let global_score = global.score();
+
+        let mut ends_free =
+            WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryUltraLow)
+                .affine(1, 5, 1)
+                .build()
+                .unwrap();
+        let ends_free_result = ends_free.align_ends_free_lambda(
+            PATTERN.len(),
+            0,
+            0,
+            TEXT.len(),
+            0,
+            0,
+            |pattern_pos, text_pos| PATTERN[pattern_pos] == TEXT[text_pos],
+        );
+        assert_eq!(ends_free_result.status, AlignmentStatus::StatusAlgCompleted);
+        assert_eq!(ends_free.score(), global_score);
+    }
+
+    #[test]
     fn test_ends_free_with_match_penalties() {
         let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryLow)
             .affine_with_match(-1, 3, 2, 1)
@@ -2929,6 +3416,100 @@ mod tests {
         assert_eq!(alignment.yend, 0);
 
         assert_eq!(aligner.get_alignment_span(), ((0, 0), (0, 0)));
+    }
+
+    #[test]
+    fn test_align_extension_lambda_matches_byte_alignment_outputs() {
+        let pattern = b"AATTTAAGTCTGCTACTTTCACGCAGCT";
+        let text = b"AATTTCAGTCTGGCTACTTTCACGTACGATGACAGACTCT";
+
+        let mut byte_aligner =
+            WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
+                .affine(6, 4, 2)
+                .build()
+                .unwrap();
+        let byte_result = byte_aligner.align_extension(pattern, text);
+        assert_eq!(byte_result.status, AlignmentStatus::StatusAlgPartial);
+
+        let byte_score = byte_aligner.score();
+        let byte_wfa_cigar = byte_aligner.wfa_cigar_bytes();
+        let byte_sam_cigar = byte_aligner.sam_cigar_bytes();
+        let byte_wfa_packed = byte_aligner.wfa_packed_cigar(true);
+        let byte_sam_packed = byte_aligner.sam_packed_cigar(true);
+        let byte_cigar_score = byte_aligner.cigar_score();
+        let byte_span = byte_aligner.get_alignment_span();
+        let byte_alignment = byte_aligner.get_alignment();
+
+        let mut lambda_aligner =
+            WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
+                .affine(6, 4, 2)
+                .build()
+                .unwrap();
+        let lambda_result = lambda_aligner.align_extension_lambda(
+            pattern.len(),
+            text.len(),
+            |pattern_pos, text_pos| pattern[pattern_pos] == text[text_pos],
+        );
+
+        assert_eq!(lambda_result.status, byte_result.status);
+        assert_eq!(lambda_result.score, byte_result.score);
+        assert_eq!(lambda_aligner.score(), byte_score);
+        assert_eq!(lambda_aligner.wfa_cigar_bytes(), byte_wfa_cigar);
+        assert_eq!(lambda_aligner.sam_cigar_bytes(), byte_sam_cigar);
+        assert_eq!(lambda_aligner.wfa_packed_cigar(true), byte_wfa_packed);
+        assert_eq!(lambda_aligner.sam_packed_cigar(true), byte_sam_packed);
+        assert_eq!(lambda_aligner.cigar_score(), byte_cigar_score);
+        assert_eq!(lambda_aligner.get_alignment_span(), byte_span);
+        assert_eq!(lambda_aligner.get_alignment(), byte_alignment);
+    }
+
+    #[test]
+    fn test_align_extension_lambda_empty_prefix_has_zero_span() {
+        let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
+            .affine(6, 4, 2)
+            .build()
+            .unwrap();
+
+        let result = aligner.align_extension_lambda(8, 8, |_, _| false);
+        assert_eq!(result.status, AlignmentStatus::StatusAlgPartial);
+        assert_eq!(aligner.cigar_string(None), "");
+
+        let alignment = aligner.get_alignment();
+        assert!(alignment.operations.is_empty());
+        assert_eq!(alignment.xstart, 0);
+        assert_eq!(alignment.xend, 0);
+        assert_eq!(alignment.ystart, 0);
+        assert_eq!(alignment.yend, 0);
+
+        assert_eq!(aligner.get_alignment_span(), ((0, 0), (0, 0)));
+    }
+
+    #[test]
+    fn test_align_extension_lambda_rejects_ultralow_memory() {
+        let matcher_calls = AtomicU64::new(0);
+        let mut aligner =
+            WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryUltraLow)
+                .affine(6, 4, 2)
+                .build()
+                .unwrap();
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            aligner.align_extension_lambda(4, 4, |_, _| {
+                matcher_calls.fetch_add(1, Ordering::Relaxed);
+                true
+            });
+        }));
+
+        let payload = result.expect_err("expected MemoryUltraLow extension lambda rejection");
+        let message = payload
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| payload.downcast_ref::<String>().map(String::as_str));
+        assert_eq!(
+            message,
+            Some("Extension alignment is not supported with MemoryUltraLow")
+        );
+        assert_eq!(matcher_calls.load(Ordering::Relaxed), 0);
     }
 
     #[test]
