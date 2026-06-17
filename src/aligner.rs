@@ -10,6 +10,7 @@ use std::path::Path;
 const DPMATRIX_DIAGONAL_NULL: i32 = i32::MAX;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum MemoryModel {
     MemoryHigh,
     MemoryMed,
@@ -18,6 +19,7 @@ pub enum MemoryModel {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum WfaOp {
     Match,
     Subst,
@@ -38,6 +40,7 @@ impl WfaOp {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct WfaAlign {
     /// WFA alignment score (cost).
     pub score: i32,
@@ -58,6 +61,7 @@ pub struct WfaAlign {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum AlignmentScope {
     Score,
     Alignment,
@@ -74,6 +78,7 @@ impl From<u32> for AlignmentScope {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum AdaptiveHeuristic {
     WfAdaptive {
         min_wavefront_length: i32,
@@ -86,18 +91,21 @@ pub enum AdaptiveHeuristic {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum DropHeuristic {
     XDrop { xdrop: i32 },
     ZDrop { zdrop: i32 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum BandHeuristic {
     Static { min_k: i32, max_k: i32 },
     Adaptive { min_k: i32, max_k: i32 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Heuristics {
     steps_between_cutoffs: i32,
     adaptive: Option<AdaptiveHeuristic>,
@@ -243,6 +251,7 @@ impl Heuristics {
 /// the `openmp` feature. In testing, OpenMP was workload-sensitive and often
 /// flat or slower, so `1` is the safest default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ResourceLimits {
     /// Maximum WFA score steps before aborting with `StatusMaxStepsReached`.
     ///
@@ -273,6 +282,7 @@ pub struct ResourceLimits {
 /// WFA2's upstream `.plot` text format during alignment; it does not render an
 /// image.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct PlotOptions {
     /// Total heatmap resolution points used by WFA2's plot recorder.
     ///
@@ -347,6 +357,7 @@ impl ResourceLimits {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum DistanceMetric {
     Indel,
     Edit,
@@ -356,6 +367,7 @@ pub enum DistanceMetric {
 }
 
 #[derive(Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Penalties {
     Indel, // Conceptually: mismatch=inf, indel=1
     Edit,  // Conceptually: mismatch=1, indel=1
@@ -394,6 +406,7 @@ impl From<u32> for DistanceMetric {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum AlignmentStatus {
     // OK Status (>=0)
     StatusAlgCompleted = wfa2::WF_STATUS_ALG_COMPLETED as isize,
@@ -411,6 +424,7 @@ pub enum AlignmentStatus {
 /// available. `memory_used` is the current memory usage reported by WFA2 in
 /// bytes, not a peak-memory measurement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct AlignmentResult {
     pub status: AlignmentStatus,
     pub score: i32,
@@ -3398,5 +3412,570 @@ mod tests {
         assert_eq!(alignment.xend, xend);
         assert_eq!(alignment.ystart, ystart);
         assert_eq!(alignment.yend, yend);
+    }
+
+    #[test]
+    #[should_panic(expected = "max_alignment_steps must be positive")]
+    fn test_resource_limits_rejects_nonpositive_max_alignment_steps() {
+        ResourceLimits::new(0, 100, 100, 1, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "max_memory_resident must be less than or equal to max_memory_abort")]
+    fn test_resource_limits_rejects_resident_above_abort() {
+        ResourceLimits::new(1, 100, 50, 1, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "max_num_threads must be positive")]
+    fn test_resource_limits_rejects_nonpositive_threads() {
+        ResourceLimits::new(1, 50, 50, 0, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "min_offsets_per_thread must be positive")]
+    fn test_resource_limits_rejects_nonpositive_min_offsets() {
+        ResourceLimits::new(1, 50, 50, 1, 0);
+    }
+
+    #[test]
+    fn test_resource_limits_allows_equal_memory_thresholds() {
+        // The resident <= abort invariant is inclusive at the boundary.
+        let limits = ResourceLimits::new(1, 50, 50, 1, 1);
+        assert_eq!(limits.max_memory_resident, 50);
+        assert_eq!(limits.max_memory_abort, 50);
+    }
+
+    #[test]
+    #[should_panic(expected = "max_memory_resident must be less than or equal to max_memory_abort")]
+    fn test_builder_with_max_memory_validates() {
+        let _ = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
+            .with_max_memory(100, 50);
+    }
+
+    #[test]
+    #[should_panic(expected = "max_alignment_steps must be positive")]
+    fn test_runtime_set_max_alignment_steps_validates() {
+        let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
+            .edit()
+            .build();
+        aligner.set_max_alignment_steps(0);
+    }
+
+    #[test]
+    #[should_panic(expected = "resolution_points must be positive")]
+    fn test_plot_options_rejects_nonpositive_resolution() {
+        PlotOptions::new(0, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "align_level must be greater than or equal to -1")]
+    fn test_plot_options_rejects_align_level_below_minus_one() {
+        PlotOptions::new(2000, -2);
+    }
+
+    #[test]
+    fn test_plot_options_allows_final_alignment_sentinel() {
+        // align_level == -1 is the valid "final/subsidiary alignment" sentinel.
+        let options = PlotOptions::new(2000, -1);
+        assert_eq!(options.align_level, -1);
+        assert_eq!(PlotOptions::final_alignment().align_level, -1);
+        assert_eq!(PlotOptions::at_recursion_level(0).align_level, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "steps_between_cutoffs must be positive")]
+    fn test_heuristics_rejects_nonpositive_steps() {
+        Heuristics::new(0);
+    }
+
+    #[test]
+    #[should_panic(expected = "min_wavefront_length must be positive")]
+    fn test_heuristics_rejects_nonpositive_min_wavefront_length() {
+        Heuristics::wf_adaptive(1, 0, 50);
+    }
+
+    #[test]
+    #[should_panic(expected = "max_distance_threshold must be non-negative")]
+    fn test_heuristics_rejects_negative_max_distance_threshold() {
+        Heuristics::wf_adaptive(1, 1, -1);
+    }
+
+    #[test]
+    fn test_heuristics_allows_zero_max_distance_threshold() {
+        let heuristics = Heuristics::wf_adaptive(1, 1, 0);
+        assert_eq!(
+            heuristics.adaptive(),
+            Some(AdaptiveHeuristic::WfAdaptive {
+                min_wavefront_length: 1,
+                max_distance_threshold: 0,
+            })
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "xdrop must be non-negative")]
+    fn test_heuristics_rejects_negative_xdrop() {
+        Heuristics::xdrop(1, -1);
+    }
+
+    #[test]
+    #[should_panic(expected = "zdrop must be non-negative")]
+    fn test_heuristics_rejects_negative_zdrop() {
+        Heuristics::zdrop(1, -1);
+    }
+
+    #[test]
+    fn test_heuristics_allows_zero_drop() {
+        assert_eq!(
+            Heuristics::xdrop(1, 0).drop_heuristic(),
+            Some(DropHeuristic::XDrop { xdrop: 0 })
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "min_k must be less than or equal to max_k")]
+    fn test_heuristics_rejects_inverted_band() {
+        Heuristics::banded_static(5, 4);
+    }
+
+    #[test]
+    fn test_heuristics_allows_equal_band_bounds() {
+        assert_eq!(
+            Heuristics::banded_static(5, 5).band(),
+            Some(BandHeuristic::Static { min_k: 5, max_k: 5 })
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "Must set a penalty model before building the aligner")]
+    fn test_builder_rejects_missing_penalty_model() {
+        let _ = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh).build();
+    }
+
+    #[test]
+    fn test_decode_sam_cigar_covers_all_op_codes_and_unknown_fallback() {
+        // Encoding is (length << 4) | op_code. Cover every documented op code plus an
+        // out-of-range code (>= 9) that must decode to the '?' fallback.
+        let buffer = vec![
+            (1u32 << 4) | 0,  // 1M
+            (2u32 << 4) | 1,  // 2I
+            (3u32 << 4) | 2,  // 3D
+            (4u32 << 4) | 3,  // 4N
+            (5u32 << 4) | 4,  // 5S
+            (6u32 << 4) | 5,  // 6H
+            (7u32 << 4) | 6,  // 7P
+            (8u32 << 4) | 7,  // 8=
+            (9u32 << 4) | 8,  // 9X
+            (10u32 << 4) | 9, // 10? (unknown op code)
+        ];
+        let decoded = WFAligner::decode_sam_cigar(&buffer);
+        assert_eq!(
+            decoded,
+            vec![
+                (1, 'M'),
+                (2, 'I'),
+                (3, 'D'),
+                (4, 'N'),
+                (5, 'S'),
+                (6, 'H'),
+                (7, 'P'),
+                (8, '='),
+                (9, 'X'),
+                (10, '?'),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_decode_sam_cigar_empty_buffer() {
+        assert!(WFAligner::decode_sam_cigar(&[]).is_empty());
+    }
+
+    #[test]
+    fn test_decode_sam_cigar_decodes_large_lengths() {
+        // 28-bit maximum length must survive the >> 4 shift without truncation.
+        let max_len = (1u32 << 28) - 1;
+        let buffer = vec![(max_len << 4) | 0];
+        assert_eq!(
+            WFAligner::decode_sam_cigar(&buffer),
+            vec![(max_len as usize, 'M')]
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "Cannot clip when AlignmentScope is Score")]
+    fn test_cigar_score_clipped_rejects_score_scope() {
+        let aligner = WFAligner::builder(AlignmentScope::Score, MemoryModel::MemoryHigh)
+            .edit()
+            .build();
+        aligner.cigar_score_clipped(0);
+    }
+
+    #[test]
+    #[should_panic(expected = "Cannot count matches when AlignmentScope is Score")]
+    fn test_count_matches_rejects_score_scope() {
+        let aligner = WFAligner::builder(AlignmentScope::Score, MemoryModel::MemoryHigh)
+            .edit()
+            .build();
+        aligner.count_matches();
+    }
+
+    #[test]
+    #[should_panic(expected = "Cannot get SAM CIGAR when AlignmentScope is Score")]
+    fn test_get_sam_cigar_rejects_score_scope() {
+        let aligner = WFAligner::builder(AlignmentScope::Score, MemoryModel::MemoryHigh)
+            .edit()
+            .build();
+        aligner.get_sam_cigar(true);
+    }
+
+    #[test]
+    #[should_panic(expected = "Cannot calculate CIGAR score when AlignmentScope is Score")]
+    fn test_cigar_score_rejects_score_scope() {
+        let mut aligner = WFAligner::builder(AlignmentScope::Score, MemoryModel::MemoryHigh)
+            .edit()
+            .build();
+        aligner.cigar_score();
+    }
+
+    #[test]
+    fn test_cigar_operations_empty_under_score_scope() {
+        // Unlike the other accessors, cigar_operations() is documented to return an empty
+        // Vec (not panic) when scope is Score.
+        let mut aligner = WFAligner::builder(AlignmentScope::Score, MemoryModel::MemoryHigh)
+            .edit()
+            .build();
+        let result = aligner.align_end_to_end(PATTERN, TEXT);
+        assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
+        assert!(aligner.cigar_operations().is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "Unknown alignment status")]
+    fn test_alignment_status_from_unknown_panics() {
+        let _ = AlignmentStatus::from(123_456_i32);
+    }
+
+    #[test]
+    #[should_panic(expected = "Unknown distance metric")]
+    fn test_distance_metric_from_unknown_panics() {
+        let _ = DistanceMetric::from(9999_u32);
+    }
+
+    #[test]
+    #[should_panic(expected = "Unknown alignment scope")]
+    fn test_alignment_scope_from_unknown_panics() {
+        let _ = AlignmentScope::from(9999_u32);
+    }
+
+    #[test]
+    #[should_panic(expected = "Invalid alignment operation character")]
+    fn test_wfa_op_from_invalid_byte_panics() {
+        let _ = WfaOp::from_u8(b'Z');
+    }
+
+    #[test]
+    fn test_alignment_status_i32_round_trip() {
+        // Guards against drift between the enum discriminants and the From<i32> mapping.
+        for status in [
+            AlignmentStatus::StatusAlgCompleted,
+            AlignmentStatus::StatusAlgPartial,
+            AlignmentStatus::StatusMaxStepsReached,
+            AlignmentStatus::StatusOOM,
+            AlignmentStatus::StatusUnattainable,
+        ] {
+            assert_eq!(AlignmentStatus::from(status as i32), status);
+        }
+    }
+
+    #[test]
+    fn test_alignment_status_display_strings() {
+        assert_eq!(
+            format!("{}", AlignmentStatus::StatusAlgCompleted),
+            "StatusAlgCompleted"
+        );
+        assert_eq!(
+            format!("{}", AlignmentStatus::StatusAlgPartial),
+            "StatusAlgPartial"
+        );
+        assert_eq!(
+            format!("{}", AlignmentStatus::StatusMaxStepsReached),
+            "StatusMaxStepsReached"
+        );
+        assert_eq!(format!("{}", AlignmentStatus::StatusOOM), "StatusOOM");
+        assert_eq!(
+            format!("{}", AlignmentStatus::StatusUnattainable),
+            "StatusUnattainable"
+        );
+    }
+
+    fn divergent_sequences(len: usize) -> (Vec<u8>, Vec<u8>) {
+        // Two independent pseudo-random sequences. Being unrelated, they force a high score and
+        // therefore a large MemoryHigh wavefront footprint.
+        let bases = [b'A', b'C', b'G', b'T'];
+        let mut pattern = Vec::with_capacity(len);
+        let mut text = Vec::with_capacity(len);
+        let mut state: u64 = 0x1234_5678_9ABC_DEF0;
+        let mut next_base = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            bases[((state >> 33) % 4) as usize]
+        };
+        for _ in 0..len {
+            pattern.push(next_base());
+            text.push(next_base());
+        }
+        (pattern, text)
+    }
+
+    #[test]
+    fn test_alignment_aborts_with_oom_under_tiny_memory_budget() {
+        let (pattern, text) = divergent_sequences(2000);
+        let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
+            .with_max_memory(1024, 1024)
+            .affine(6, 4, 2)
+            .build();
+
+        let result = aligner.align_end_to_end(&pattern, &text);
+        assert_eq!(result.status, AlignmentStatus::StatusOOM);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_get_alignment_span_rejects_oom() {
+        let (pattern, text) = divergent_sequences(2000);
+        let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
+            .with_max_memory(1024, 1024)
+            .affine(6, 4, 2)
+            .build();
+
+        let result = aligner.align_end_to_end(&pattern, &text);
+        assert_eq!(result.status, AlignmentStatus::StatusOOM);
+        aligner.get_alignment_span();
+    }
+
+    #[test]
+    fn test_write_plot_rejects_interior_nul_in_path() {
+        let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
+            .with_plotting(PlotOptions::default())
+            .edit()
+            .build();
+        let result = aligner.align_end_to_end(PATTERN, TEXT);
+        assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
+
+        let err = aligner.write_plot(Path::new("bad\0name.plot")).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn test_align_empty_pattern_against_text() {
+        let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
+            .affine(6, 4, 2)
+            .build();
+
+        let text = b"ACGT";
+        let result = aligner.align_end_to_end(b"", text);
+        assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
+        assert_eq!(raw_cigar_string(&aligner), "IIII");
+
+        let alignment = aligner.get_alignment();
+        assert_eq!(alignment.xlen, 0);
+        assert_eq!(alignment.ylen, text.len());
+        assert_eq!(alignment.operations, vec![Ins, Ins, Ins, Ins]);
+        assert_eq!(aligner.get_alignment_span(), ((0, 0), (0, 4)));
+    }
+
+    #[test]
+    fn test_align_both_empty() {
+        let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
+            .affine(6, 4, 2)
+            .build();
+
+        let result = aligner.align_end_to_end(b"", b"");
+        assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
+        assert_eq!(aligner.score(), 0);
+
+        let alignment = aligner.get_alignment();
+        assert!(alignment.operations.is_empty());
+        assert_eq!(alignment.xlen, 0);
+        assert_eq!(alignment.ylen, 0);
+        assert_eq!(aligner.get_alignment_span(), ((0, 0), (0, 0)));
+        assert!(aligner.cigar_operations().is_empty());
+    }
+
+    #[test]
+    fn test_ultralow_ends_free_all_zero_matches_global() {
+        let pattern = b"AGCTAGTGTCAATGGCTACTTTTCAGGTCCT";
+        let text = b"AACTAAGTGTCGGTGGCTACTATATATCAGGTCCT";
+
+        let mut global = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryUltraLow)
+            .affine(1, 5, 1)
+            .build();
+        let global_result = global.align_end_to_end(pattern, text);
+        assert_eq!(global_result.status, AlignmentStatus::StatusAlgCompleted);
+        let global_score = global.score();
+
+        // All-zero free ends are permitted with MemoryUltraLow (the guard only fires on a
+        // nonzero free end) and must degenerate to the global alignment.
+        let mut ends_free =
+            WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryUltraLow)
+                .affine(1, 5, 1)
+                .build();
+        let ends_free_result = ends_free.align_ends_free(pattern, 0, 0, text, 0, 0);
+        assert_eq!(ends_free_result.status, AlignmentStatus::StatusAlgCompleted);
+        assert_eq!(ends_free.score(), global_score);
+    }
+
+    #[test]
+    fn test_cigar_score_clipped_flank_exceeding_alignment_is_zero() {
+        let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryLow)
+            .affine2p_with_match(-1, 3, 3, 3, 10, 0)
+            .build();
+
+        let pattern = b"TCTATAATAGT";
+        let text = b"TCTATACTGCGCGTTTGGAGAAATAAAATAGT";
+        let result = aligner.align_end_to_end(pattern, text);
+        assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
+        assert_eq!(
+            raw_cigar_string(&aligner),
+            "MMMMMMIIIIIIIIIIIIIIIIIIIIIMMMMM"
+        );
+
+        // A flank that meets or exceeds half the CIGAR collapses the clipped window to empty.
+        assert_eq!(aligner.cigar_score_clipped(1000), 0);
+        assert_eq!(aligner.cigar_score_clipped(16), 0);
+    }
+
+    #[test]
+    fn test_cigar_score_clipped_affine2p_selects_cheaper_gap_piece() {
+        let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryLow)
+            .affine2p_with_match(-1, 3, 3, 3, 10, 0)
+            .build();
+
+        let pattern = b"TCTATAATAGT";
+        let text = b"TCTATACTGCGCGTTTGGAGAAATAAAATAGT";
+        let result = aligner.align_end_to_end(pattern, text);
+        assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
+
+        // CIGAR is 6M21I5M. The 21I gap must be scored by the cheaper second piece
+        // (10 + 0*21 = 10), not the first (3 + 3*21 = 66): 6*(-1) negated = 6 for the matches,
+        // minus 10 for the gap -> 1. Selecting piece 1 would give 6 - 66 = -55.
+        assert_eq!(aligner.cigar_score_clipped(0), 1);
+
+        // Clipping into the middle leaves a pure 16I window, also scored by piece 2
+        // (10 + 0*16 = 10).
+        assert_eq!(aligner.cigar_score_clipped(8), -10);
+    }
+
+    #[test]
+    fn test_count_matches_direct() {
+        let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
+            .affine(4, 6, 2)
+            .build();
+
+        let identical = b"TCTTTACTCTT";
+        let result = aligner.align_end_to_end(identical, identical);
+        assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
+        assert_eq!(aligner.count_matches(), 11);
+
+        let with_mismatch = b"TCTTTACTATT";
+        let result = aligner.align_end_to_end(identical, with_mismatch);
+        assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
+        assert_eq!(aligner.count_matches(), 10);
+    }
+
+    #[test]
+    fn test_heuristic_constructors_drive_completed_alignments() {
+        for heuristics in [
+            Heuristics::wfa2_default(),
+            Heuristics::wf_mash(1, 10, 50),
+            Heuristics::banded_adaptive(1, -50, 50),
+        ] {
+            let mut aligner =
+                WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
+                    .affine(6, 4, 2)
+                    .with_heuristics(heuristics)
+                    .build();
+            let result = aligner.align_end_to_end(PATTERN, TEXT);
+            assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
+        }
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn test_serde_round_trips_config_types() {
+        let penalties = Penalties::Affine2p {
+            match_: -1,
+            mismatch: 8,
+            gap_opening1: 4,
+            gap_extension1: 2,
+            gap_opening2: 24,
+            gap_extension2: 1,
+        };
+        let json = serde_json::to_string(&penalties).unwrap();
+        assert_eq!(serde_json::from_str::<Penalties>(&json).unwrap(), penalties);
+
+        let heuristics = Heuristics::new(3)
+            .with_adaptive(AdaptiveHeuristic::WfMash {
+                min_wavefront_length: 5,
+                max_distance_threshold: 25,
+            })
+            .with_drop(DropHeuristic::ZDrop { zdrop: 15 })
+            .with_band(BandHeuristic::Static {
+                min_k: -10,
+                max_k: 10,
+            });
+        let json = serde_json::to_string(&heuristics).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Heuristics>(&json).unwrap(),
+            heuristics
+        );
+
+        let limits = ResourceLimits::new(64, 1_048_576, 2_097_152, 1, 64);
+        let json = serde_json::to_string(&limits).unwrap();
+        assert_eq!(
+            serde_json::from_str::<ResourceLimits>(&json).unwrap(),
+            limits
+        );
+
+        let plot = PlotOptions::new(1500, -1);
+        let json = serde_json::to_string(&plot).unwrap();
+        assert_eq!(serde_json::from_str::<PlotOptions>(&json).unwrap(), plot);
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn test_serde_round_trips_result_types() {
+        let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
+            .affine(6, 4, 2)
+            .build();
+        let result = aligner.align_end_to_end(PATTERN, TEXT);
+        assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
+
+        let json = serde_json::to_string(&result).unwrap();
+        assert_eq!(
+            serde_json::from_str::<AlignmentResult>(&json).unwrap(),
+            result
+        );
+
+        let alignment = aligner.get_alignment();
+        let json = serde_json::to_string(&alignment).unwrap();
+        assert_eq!(serde_json::from_str::<WfaAlign>(&json).unwrap(), alignment);
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    #[should_panic(expected = "min_k must be less than or equal to max_k")]
+    fn test_serde_deserialized_invalid_config_is_revalidated_on_use() {
+        // Deserialization itself does not run the constructor validators, but every config
+        // type is re-validated at the FFI boundary, so an invalid deserialized value still
+        // cannot reach WFA2 silently.
+        let json = r#"{"steps_between_cutoffs":1,"adaptive":null,"drop_heuristic":null,"band":{"Static":{"min_k":10,"max_k":-10}}}"#;
+        let heuristics: Heuristics = serde_json::from_str(json).unwrap();
+        let _ = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
+            .affine(6, 4, 2)
+            .with_heuristics(heuristics);
     }
 }

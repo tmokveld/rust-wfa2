@@ -20,6 +20,8 @@ jobs:
             features: ""
           - name: openmp
             features: "--features openmp"
+          - name: serde
+            features: "--features serde"
 
     steps:
       - name: Checkout repository and submodules

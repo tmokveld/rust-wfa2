@@ -10,7 +10,11 @@ members = ["wfa2-sys"]
 [features]
 default = []
 openmp = ["wfa2-sys/openmp"]
+serde = ["dep:serde"]
 
 [dependencies]
-serde = { version = "1.0.150", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"], optional = true }
 wfa2-sys = { version = "*", path = "wfa2-sys" }
+
+[dev-dependencies]
+serde_json = "1.0"
