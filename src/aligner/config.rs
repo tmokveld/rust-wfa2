@@ -4,10 +4,21 @@ use std::fmt;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum MemoryModel {
+    /// Store all wavefronts explicitly.
     MemoryHigh,
+    /// Medium-memory piggyback mode.
     MemoryMed,
+    /// Low-memory piggyback mode.
     MemoryLow,
+    /// Bidirectional WFA mode.
     MemoryUltraLow,
+    /// Singletrack backtrace mode.
+    ///
+    /// This mode supports full alignments with gap-affine or gap-affine-2p
+    /// penalties over byte or packed 2-bit inputs. It does not support
+    /// score-only alignment, lambda/custom matchers, edit/indel/gap-linear
+    /// penalties, or banded heuristics.
+    MemorySingletrack,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -410,6 +421,10 @@ pub enum WfaError {
         distance_metric: DistanceMetric,
         reason: &'static str,
     },
+    IncompatibleMemoryModel {
+        memory_model: MemoryModel,
+        reason: &'static str,
+    },
 }
 
 impl fmt::Display for WfaError {
@@ -427,6 +442,13 @@ impl fmt::Display for WfaError {
             } => write!(
                 f,
                 "heuristics are incompatible with {distance_metric:?}: {reason}"
+            ),
+            WfaError::IncompatibleMemoryModel {
+                memory_model,
+                reason,
+            } => write!(
+                f,
+                "{memory_model:?} is incompatible with this aligner: {reason}"
             ),
         }
     }
@@ -749,4 +771,51 @@ pub(crate) fn check_heuristics_for_distance_metric(
     } else {
         Ok(())
     }
+}
+
+pub(crate) fn validate_memory_model_compatibility(
+    memory_model: MemoryModel,
+    alignment_scope: AlignmentScope,
+    penalties: Penalties,
+    heuristics: &Heuristics,
+) -> Result<(), WfaError> {
+    if memory_model != MemoryModel::MemorySingletrack {
+        return Ok(());
+    }
+
+    let invalid = |reason| WfaError::IncompatibleMemoryModel {
+        memory_model,
+        reason,
+    };
+
+    if alignment_scope != AlignmentScope::Alignment {
+        return Err(invalid("singletrack requires full alignment scope"));
+    }
+
+    if !matches!(
+        penalties,
+        Penalties::Affine { .. } | Penalties::Affine2p { .. }
+    ) {
+        return Err(invalid(
+            "singletrack only supports gap-affine and gap-affine-2p penalties",
+        ));
+    }
+
+    if heuristics.band().is_some() {
+        return Err(invalid("singletrack does not support banded heuristics"));
+    }
+
+    Ok(())
+}
+
+pub(crate) fn assert_memory_model_compatibility(
+    memory_model: MemoryModel,
+    alignment_scope: AlignmentScope,
+    penalties: Penalties,
+    heuristics: &Heuristics,
+) {
+    validate_memory_model_compatibility(memory_model, alignment_scope, penalties, heuristics)
+        .unwrap_or_else(|err| {
+            panic!("{err}");
+        });
 }

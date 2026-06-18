@@ -8,8 +8,9 @@ use std::path::Path;
 use super::attributes::WFAttributes;
 use super::cigar::CigarView;
 use super::config::{
-    validate_heuristics_for_distance_metric, validate_max_alignment_steps, validate_max_memory,
-    validate_max_num_threads, validate_min_offsets_per_thread, validate_penalties,
+    assert_memory_model_compatibility, validate_heuristics_for_distance_metric,
+    validate_max_alignment_steps, validate_max_memory, validate_max_num_threads,
+    validate_memory_model_compatibility, validate_min_offsets_per_thread, validate_penalties,
     AdaptiveHeuristic, AlignmentResult, AlignmentScope, AlignmentStatus, BandHeuristic,
     DistanceMetric, DropHeuristic, Heuristics, MemoryModel, Penalties, ResourceLimits, WfaError,
 };
@@ -54,6 +55,12 @@ pub(crate) struct WfaRawHandle {
 impl WfaRawHandle {
     pub(crate) fn new(mut attributes: WFAttributes) -> Result<Self, WfaError> {
         validate_penalties(attributes.penalties())?;
+        validate_memory_model_compatibility(
+            attributes.selected_memory_model(),
+            attributes.alignment_scope_value(),
+            attributes.penalties(),
+            &Heuristics::none(),
+        )?;
 
         let inner = unsafe { wfa2::wavefront_aligner_new(&mut attributes.inner) };
         Ok(Self {
@@ -72,16 +79,7 @@ impl WfaRawHandle {
     }
 
     pub(crate) fn memory_model(&self) -> MemoryModel {
-        match self.attributes.inner.memory_mode {
-            wfa2::wavefront_memory_t_wavefront_memory_high => MemoryModel::MemoryHigh,
-            wfa2::wavefront_memory_t_wavefront_memory_med => MemoryModel::MemoryMed,
-            wfa2::wavefront_memory_t_wavefront_memory_low => MemoryModel::MemoryLow,
-            wfa2::wavefront_memory_t_wavefront_memory_ultralow => MemoryModel::MemoryUltraLow,
-            _ => panic!(
-                "Unknown memory model: {}",
-                self.attributes.inner.memory_mode
-            ),
-        }
+        self.attributes.selected_memory_model()
     }
 
     pub(crate) fn penalties(&self) -> Penalties {
@@ -187,6 +185,14 @@ impl WfaRawHandle {
     fn assert_extension_supported(&self) {
         if self.memory_model() == MemoryModel::MemoryUltraLow {
             panic!("Extension alignment is not supported with MemoryUltraLow");
+        }
+    }
+
+    /// Panic if a lambda/custom matcher was requested under `MemorySingletrack`,
+    /// which WFA2 rejects by exiting the process.
+    fn assert_lambda_supported(&self) {
+        if self.memory_model() == MemoryModel::MemorySingletrack {
+            panic!("Lambda/custom sequence inputs are not supported with MemorySingletrack");
         }
     }
 
@@ -402,6 +408,7 @@ impl WfaRawHandle {
     where
         F: Fn(usize, usize) -> bool + Sync,
     {
+        self.assert_lambda_supported();
         self.last_sequence_lengths = Some((pattern_len, text_len));
 
         let context = LambdaMatcherContext::new(matcher);
@@ -726,6 +733,12 @@ impl WfaRawHandle {
     pub(crate) fn set_heuristics(&mut self, heuristics: Heuristics) {
         heuristics.validate();
         validate_heuristics_for_distance_metric(&heuristics, self.distance_metric());
+        assert_memory_model_compatibility(
+            self.memory_model(),
+            self.alignment_scope(),
+            self.penalties(),
+            &heuristics,
+        );
 
         let cached = &mut self.attributes.inner.heuristic;
         cached.strategy = wfa2::wf_heuristic_strategy_wf_heuristic_none;

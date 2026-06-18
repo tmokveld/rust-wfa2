@@ -87,6 +87,19 @@ assert_eq!(
 );
 ```
 
+### Memory models
+
+`MemoryModel::MemoryUltraLow` selects WFA2's BiWFA mode.
+`MemoryModel::MemorySingletrack` selects WFA2's singletrack backtrace mode for
+low-memory full alignments. Singletrack supports `affine` and `affine2p`
+penalties over byte-slice and packed 2-bit inputs, with end-to-end, ends-free,
+and extension spans.
+
+Singletrack does not support `AlignmentScope::Score`, lambda/custom matchers,
+edit/indel/gap-linear penalties, BiWFA, or banded heuristics. Unsupported
+builder configurations return `WfaError::IncompatibleMemoryModel`; unsupported
+lambda calls panic before entering WFA2.
+
 ### CIGAR orientation and SAM
 
 WFA2 CIGAR operations describe how to transform the `pattern` argument into the

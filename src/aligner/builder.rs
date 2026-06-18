@@ -1,7 +1,7 @@
 use super::attributes::WFAttributes;
 use super::config::{
-    check_heuristics_for_distance_metric, AlignmentScope, Heuristics, MemoryModel, PlotOptions,
-    ResourceLimits, WfaError,
+    check_heuristics_for_distance_metric, validate_memory_model_compatibility, AlignmentScope,
+    Heuristics, MemoryModel, PlotOptions, ResourceLimits, WfaError,
 };
 use super::facade::WFAligner;
 use super::raw::WfaRawHandle;
@@ -182,6 +182,14 @@ impl WFAlignerBuilder {
         if let Some(heuristics) = self.heuristics {
             check_heuristics_for_distance_metric(&heuristics, self.attributes.distance_metric())?;
         }
+
+        let heuristics = self.heuristics.unwrap_or_default();
+        validate_memory_model_compatibility(
+            self.attributes.selected_memory_model(),
+            self.attributes.alignment_scope_value(),
+            self.attributes.penalties(),
+            &heuristics,
+        )?;
 
         let mut raw = WfaRawHandle::new(self.attributes)?;
 

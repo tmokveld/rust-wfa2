@@ -46,6 +46,28 @@ fn assert_plot_metadata_and_heatmap(plot: &str) {
     assert!(plot.contains("# Heatmap M\n"));
 }
 
+fn assert_alignment_surfaces_match(expected: &mut WFAligner, actual: &mut WFAligner) {
+    assert_eq!(actual.score(), expected.score());
+    assert_eq!(actual.wfa_cigar_bytes(), expected.wfa_cigar_bytes());
+    assert_eq!(actual.sam_cigar_bytes(), expected.sam_cigar_bytes());
+    assert_eq!(
+        actual.wfa_packed_cigar(true),
+        expected.wfa_packed_cigar(true)
+    );
+    assert_eq!(
+        actual.sam_packed_cigar(true),
+        expected.sam_packed_cigar(true)
+    );
+    assert_eq!(actual.count_matches(), expected.count_matches());
+    assert_eq!(
+        actual.cigar_score_clipped(0),
+        expected.cigar_score_clipped(0)
+    );
+    assert_eq!(actual.cigar_score(), expected.cigar_score());
+    assert_eq!(actual.get_alignment_span(), expected.get_alignment_span());
+    assert_eq!(actual.get_alignment(), expected.get_alignment());
+}
+
 fn run_invalid_penalty_child(case: &str) {
     let result = match case {
         "linear" => WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
@@ -1518,6 +1540,222 @@ fn test_memory_modes() {
         let (a, b, c) = aligner.matching(PATTERN, TEXT, None);
         assert_eq!(format!("{}\n{}\n{}", a, b, c), expected_matching);
     }
+}
+
+#[test]
+fn test_singletrack_gap_affine_end_to_end_matches_high_memory() {
+    let mut high = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
+        .affine(6, 4, 2)
+        .build()
+        .unwrap();
+    let high_result = high.align_end_to_end(PATTERN, TEXT);
+    assert_eq!(high_result.status, AlignmentStatus::StatusAlgCompleted);
+
+    let mut singletrack =
+        WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemorySingletrack)
+            .affine(6, 4, 2)
+            .build()
+            .unwrap();
+    let singletrack_result = singletrack.align_end_to_end(PATTERN, TEXT);
+
+    assert_eq!(singletrack_result.status, high_result.status);
+    assert_eq!(singletrack_result.score, high_result.score);
+    assert_alignment_surfaces_match(&mut high, &mut singletrack);
+}
+
+#[test]
+fn test_singletrack_gap_affine2p_end_to_end_matches_high_memory() {
+    let mut high = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
+        .affine2p_with_match(-1, 3, 3, 3, 10, 0)
+        .build()
+        .unwrap();
+    let high_result = high.align_end_to_end(PATTERN, TEXT);
+    assert_eq!(high_result.status, AlignmentStatus::StatusAlgCompleted);
+
+    let mut singletrack =
+        WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemorySingletrack)
+            .affine2p_with_match(-1, 3, 3, 3, 10, 0)
+            .build()
+            .unwrap();
+    let singletrack_result = singletrack.align_end_to_end(PATTERN, TEXT);
+
+    assert_eq!(singletrack_result.status, high_result.status);
+    assert_eq!(singletrack_result.score, high_result.score);
+    assert_alignment_surfaces_match(&mut high, &mut singletrack);
+}
+
+#[test]
+fn test_singletrack_ends_free_matches_high_memory() {
+    let pattern = b"AGTGTCAATGGCTAC";
+    let text = b"GGGGGGGGGGAGTGTCAATGGCTACGGGGGGGGGG";
+
+    let mut high = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
+        .affine_with_match(-1, 2, 2, 1)
+        .build()
+        .unwrap();
+    let high_result =
+        high.align_ends_free(pattern, 0, 0, text, text.len() as i32, text.len() as i32);
+    assert_eq!(high_result.status, AlignmentStatus::StatusAlgCompleted);
+
+    let mut singletrack =
+        WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemorySingletrack)
+            .affine_with_match(-1, 2, 2, 1)
+            .build()
+            .unwrap();
+    let singletrack_result =
+        singletrack.align_ends_free(pattern, 0, 0, text, text.len() as i32, text.len() as i32);
+
+    assert_eq!(singletrack_result.status, high_result.status);
+    assert_eq!(singletrack_result.score, high_result.score);
+    assert_alignment_surfaces_match(&mut high, &mut singletrack);
+}
+
+#[test]
+fn test_singletrack_extension_matches_high_memory() {
+    let pattern = b"AATTTAAGTCTGCTACTTTCACGCAGCT";
+    let text = b"AATTTCAGTCTGGCTACTTTCACGTACGATGACAGACTCT";
+
+    let mut high = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
+        .affine(6, 4, 2)
+        .build()
+        .unwrap();
+    let high_result = high.align_extension(pattern, text);
+    assert_eq!(high_result.status, AlignmentStatus::StatusAlgPartial);
+
+    let mut singletrack =
+        WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemorySingletrack)
+            .affine(6, 4, 2)
+            .build()
+            .unwrap();
+    let singletrack_result = singletrack.align_extension(pattern, text);
+
+    assert_eq!(singletrack_result.status, high_result.status);
+    assert_eq!(singletrack_result.score, high_result.score);
+    assert_alignment_surfaces_match(&mut high, &mut singletrack);
+}
+
+#[test]
+fn test_singletrack_packed2bits_matches_high_memory() {
+    let packed_pattern = pack_dna_2bits(PATTERN);
+    let packed_text = pack_dna_2bits(TEXT);
+
+    let mut high = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
+        .affine(1, 5, 1)
+        .build()
+        .unwrap();
+    let high_result =
+        high.align_end_to_end_packed2bits(&packed_pattern, PATTERN.len(), &packed_text, TEXT.len());
+    assert_eq!(high_result.status, AlignmentStatus::StatusAlgCompleted);
+
+    let mut singletrack =
+        WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemorySingletrack)
+            .affine(1, 5, 1)
+            .build()
+            .unwrap();
+    let singletrack_result = singletrack.align_end_to_end_packed2bits(
+        &packed_pattern,
+        PATTERN.len(),
+        &packed_text,
+        TEXT.len(),
+    );
+
+    assert_eq!(singletrack_result.status, high_result.status);
+    assert_eq!(singletrack_result.score, high_result.score);
+    assert_alignment_surfaces_match(&mut high, &mut singletrack);
+}
+
+#[test]
+fn test_singletrack_allows_non_banded_heuristics() {
+    for heuristics in [
+        Heuristics::wf_adaptive(1, 10, 50),
+        Heuristics::wf_mash(1, 10, 50),
+        Heuristics::xdrop(1, 10),
+        Heuristics::zdrop(1, 10),
+    ] {
+        let mut aligner =
+            WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemorySingletrack)
+                .affine(6, 4, 2)
+                .with_heuristics(heuristics)
+                .build()
+                .unwrap();
+        let result = aligner.align_end_to_end(PATTERN, TEXT);
+        assert!(matches!(
+            result.status,
+            AlignmentStatus::StatusAlgCompleted | AlignmentStatus::StatusAlgPartial
+        ));
+    }
+}
+
+#[test]
+fn test_singletrack_rejects_unsupported_builder_configs() {
+    let score_result = WFAligner::builder(AlignmentScope::Score, MemoryModel::MemorySingletrack)
+        .affine(6, 4, 2)
+        .build();
+    assert!(matches!(
+        score_result,
+        Err(WfaError::IncompatibleMemoryModel { .. })
+    ));
+
+    for result in [
+        WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemorySingletrack)
+            .indel()
+            .build(),
+        WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemorySingletrack)
+            .edit()
+            .build(),
+        WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemorySingletrack)
+            .linear(6, 2)
+            .build(),
+        WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemorySingletrack)
+            .affine(6, 4, 2)
+            .with_heuristics(Heuristics::banded_static(-10, 10))
+            .build(),
+        WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemorySingletrack)
+            .affine(6, 4, 2)
+            .with_heuristics(Heuristics::banded_adaptive(1, -10, 10))
+            .build(),
+    ] {
+        assert!(matches!(
+            result,
+            Err(WfaError::IncompatibleMemoryModel { .. })
+        ));
+    }
+}
+
+#[test]
+fn test_singletrack_set_heuristics_rejects_banded() {
+    let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemorySingletrack)
+        .affine(6, 4, 2)
+        .build()
+        .unwrap();
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        aligner.set_heuristics(Heuristics::banded_static(-10, 10));
+    }));
+
+    let payload = result.expect_err("expected MemorySingletrack banded heuristic rejection");
+    assert_eq!(
+        panic_message(payload.as_ref()),
+        Some("MemorySingletrack is incompatible with this aligner: singletrack does not support banded heuristics")
+    );
+}
+
+#[test]
+fn test_singletrack_rejects_lambda_inputs_before_entering_c() {
+    let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemorySingletrack)
+        .affine(6, 4, 2)
+        .build()
+        .unwrap();
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        aligner.align_end_to_end_lambda(4, 4, |_, _| true);
+    }));
+
+    let payload = result.expect_err("expected MemorySingletrack lambda rejection");
+    assert_eq!(
+        panic_message(payload.as_ref()),
+        Some("Lambda/custom sequence inputs are not supported with MemorySingletrack")
+    );
 }
 
 #[test]

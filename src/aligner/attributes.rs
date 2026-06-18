@@ -27,6 +27,7 @@ impl WFAttributes {
             MemoryModel::MemoryMed => wfa2::wavefront_memory_t_wavefront_memory_med,
             MemoryModel::MemoryLow => wfa2::wavefront_memory_t_wavefront_memory_low,
             MemoryModel::MemoryUltraLow => wfa2::wavefront_memory_t_wavefront_memory_ultralow,
+            MemoryModel::MemorySingletrack => wfa2::wavefront_memory_t_wavefront_memory_singletrack,
         };
         self.inner.memory_mode = memory_mode;
         self
@@ -39,6 +40,21 @@ impl WFAttributes {
         };
         self.inner.alignment_scope = alignment_scope;
         self
+    }
+
+    pub(crate) fn selected_memory_model(&self) -> MemoryModel {
+        match self.inner.memory_mode {
+            wfa2::wavefront_memory_t_wavefront_memory_high => MemoryModel::MemoryHigh,
+            wfa2::wavefront_memory_t_wavefront_memory_med => MemoryModel::MemoryMed,
+            wfa2::wavefront_memory_t_wavefront_memory_low => MemoryModel::MemoryLow,
+            wfa2::wavefront_memory_t_wavefront_memory_ultralow => MemoryModel::MemoryUltraLow,
+            wfa2::wavefront_memory_t_wavefront_memory_singletrack => MemoryModel::MemorySingletrack,
+            _ => panic!("Unknown memory model: {}", self.inner.memory_mode),
+        }
+    }
+
+    pub(crate) fn alignment_scope_value(&self) -> AlignmentScope {
+        AlignmentScope::from(self.inner.alignment_scope)
     }
 
     pub(crate) fn resource_limits(&self) -> ResourceLimits {

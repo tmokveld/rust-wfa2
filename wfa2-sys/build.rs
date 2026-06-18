@@ -18,6 +18,7 @@ impl bindgen::callbacks::ParseCallbacks for IgnoreMacros {
 fn main() {
     let openmp_enabled = env::var_os("CARGO_FEATURE_OPENMP").is_some();
     emit_rerun_if_env_changed();
+    println!("cargo:rerun-if-changed=WFA2-lib");
 
     let mut cmake = cmake::Config::new("WFA2-lib");
     // Force an optimized C build regardless of the Cargo profile. WFA2's CMakeLists only appends

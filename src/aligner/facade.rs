@@ -78,6 +78,9 @@ impl WFAligner {
     /// borrowed only for this call, but it must be `Sync` because WFA2 may call
     /// it from multiple worker threads when native parallelism is enabled.
     ///
+    /// `MemorySingletrack` is rejected because WFA2's singletrack path does not
+    /// support lambda/custom matchers.
+    ///
     /// Panics inside the matcher are caught at the C callback boundary and
     /// resumed after WFA2 returns.
     pub fn align_end_to_end_lambda<F>(
@@ -155,7 +158,8 @@ impl WFAligner {
     /// Free-end counts use the same WFA pattern/text axes as
     /// [`WFAligner::align_ends_free`] and otherwise follow the same native
     /// handling. `MemoryUltraLow` is rejected for nonzero free ends, matching
-    /// byte-slice ends-free alignment.
+    /// byte-slice ends-free alignment. `MemorySingletrack` is rejected because
+    /// WFA2's singletrack path does not support lambda/custom matchers.
     #[allow(clippy::too_many_arguments)]
     pub fn align_ends_free_lambda<F>(
         &mut self,
@@ -215,6 +219,8 @@ impl WFAligner {
     /// The matcher contract is the same as
     /// [`WFAligner::align_end_to_end_lambda`]. `MemoryUltraLow` is rejected
     /// because WFA2's BiWFA path exits the process for extension alignments.
+    /// `MemorySingletrack` is rejected because WFA2's singletrack path does not
+    /// support lambda/custom matchers.
     pub fn align_extension_lambda<F>(
         &mut self,
         pattern_len: usize,
