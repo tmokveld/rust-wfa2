@@ -54,9 +54,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          fm=$(find target -name flags.make -path '*wfa2*' | head -1)
+          fm=$(find target -path '*/CMakeFiles/wfa2_static.dir/flags.make' | head -1)
           if [ -z "$fm" ]; then
-            echo "could not locate WFA2 flags.make under target/" >&2
+            echo "could not locate WFA2 static library flags.make under target/" >&2
             exit 1
           fi
           echo "Inspecting $fm"
