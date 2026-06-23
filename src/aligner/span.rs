@@ -2,8 +2,8 @@
 ///
 /// Both leading and trailing indels are stripped, so the span covers only the aligned core
 /// (from the first to the last `M`/`X` column). This keeps the two axes symmetric and is used
-/// for ends-free/local alignments, which are always computed unidirectionally (BiWFA is rejected
-/// for those modes), so the full CIGAR is available here.
+/// for ends-free/local alignments. The span is derived from the active CIGAR so it remains
+/// consistent across both unidirectional and BiWFA paths.
 pub(crate) fn alignment_span_from_ops(raw_operations: &[u8]) -> ((usize, usize), (usize, usize)) {
     let mut pattern_index = 0;
     let mut text_index = 0;

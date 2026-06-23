@@ -22,6 +22,15 @@ use super::span::{alignment_span_from_ops, extension_alignment_span_from_ops};
 // that macro consistently across libclang/platform combinations.
 const DPMATRIX_DIAGONAL_NULL: i32 = i32::MAX;
 
+fn penalties_have_negative_match(penalties: Penalties) -> bool {
+    match penalties {
+        Penalties::Linear { match_, .. }
+        | Penalties::Affine { match_, .. }
+        | Penalties::Affine2p { match_, .. } => match_ < 0,
+        Penalties::Indel | Penalties::Edit => false,
+    }
+}
+
 fn path_to_cstring(path: &Path) -> io::Result<CString> {
     use std::os::unix::ffi::OsStrExt;
 
@@ -170,13 +179,17 @@ impl WfaRawHandle {
         }
     }
 
-    /// Panic if ends-free alignment was requested under `MemoryUltraLow`, which
-    /// WFA2's BiWFA path does not support for nonzero free ends.
+    /// Panic if ends-free alignment with nonzero free ends was requested under
+    /// `MemoryUltraLow` with negative match rewards. WFA2's BiWFA path still
+    /// exits the process for that combination.
     fn assert_ends_free_supported(&self, free_ends: [i32; 4]) {
         if self.memory_model() == MemoryModel::MemoryUltraLow
             && free_ends.iter().any(|&free_ends| free_ends != 0)
+            && penalties_have_negative_match(self.penalties())
         {
-            panic!("Ends-free alignment is not supported with MemoryUltraLow");
+            panic!(
+                "Ends-free alignment with negative match rewards is not supported with MemoryUltraLow"
+            );
         }
     }
 

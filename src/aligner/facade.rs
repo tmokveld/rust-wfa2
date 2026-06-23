@@ -101,8 +101,8 @@ impl WFAligner {
     /// The free-end counts are expressed on the WFA pattern/text axes and are
     /// forwarded to WFA2's ends-free alignment form. With
     /// [`AlignmentScope::Alignment`], the active CIGAR and alignment span can
-    /// be read after this call. `MemoryUltraLow` is rejected when any free-end
-    /// count is nonzero, matching WFA2's unsupported BiWFA ends-free path.
+    /// be read after this call. `MemoryUltraLow` supports ends-free alignment
+    /// except when nonzero free ends are combined with negative match rewards.
     pub fn align_ends_free(
         &mut self,
         pattern: &[u8],
@@ -127,7 +127,7 @@ impl WFAligner {
     /// Logical lengths and packed-slice layout follow
     /// [`WFAligner::align_end_to_end_packed2bits`]. Free-end counts use the
     /// same WFA pattern/text axes as [`WFAligner::align_ends_free`].
-    /// `MemoryUltraLow` is rejected for nonzero free ends, matching byte-slice
+    /// `MemoryUltraLow` follows the same support boundary as byte-slice
     /// ends-free alignment.
     #[allow(clippy::too_many_arguments)]
     pub fn align_ends_free_packed2bits(
@@ -157,7 +157,7 @@ impl WFAligner {
     ///
     /// Free-end counts use the same WFA pattern/text axes as
     /// [`WFAligner::align_ends_free`] and otherwise follow the same native
-    /// handling. `MemoryUltraLow` is rejected for nonzero free ends, matching
+    /// handling. `MemoryUltraLow` follows the same support boundary as
     /// byte-slice ends-free alignment. `MemorySingletrack` is rejected because
     /// WFA2's singletrack path does not support lambda/custom matchers.
     #[allow(clippy::too_many_arguments)]

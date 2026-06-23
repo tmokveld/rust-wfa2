@@ -17,7 +17,7 @@ pub enum MemoryModel {
     /// This mode supports full alignments with gap-affine or gap-affine-2p
     /// penalties over byte or packed 2-bit inputs. It does not support
     /// score-only alignment, lambda/custom matchers, edit/indel/gap-linear
-    /// penalties, or banded heuristics.
+    /// penalties, or BiWFA.
     MemorySingletrack,
 }
 
@@ -777,7 +777,7 @@ pub(crate) fn validate_memory_model_compatibility(
     memory_model: MemoryModel,
     alignment_scope: AlignmentScope,
     penalties: Penalties,
-    heuristics: &Heuristics,
+    _heuristics: &Heuristics,
 ) -> Result<(), WfaError> {
     if memory_model != MemoryModel::MemorySingletrack {
         return Ok(());
@@ -799,10 +799,6 @@ pub(crate) fn validate_memory_model_compatibility(
         return Err(invalid(
             "singletrack only supports gap-affine and gap-affine-2p penalties",
         ));
-    }
-
-    if heuristics.band().is_some() {
-        return Err(invalid("singletrack does not support banded heuristics"));
     }
 
     Ok(())

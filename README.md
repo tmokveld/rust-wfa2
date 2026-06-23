@@ -93,12 +93,17 @@ assert_eq!(
 `MemoryModel::MemorySingletrack` selects WFA2's singletrack backtrace mode for
 low-memory full alignments. Singletrack supports `affine` and `affine2p`
 penalties over byte-slice and packed 2-bit inputs, with end-to-end, ends-free,
-and extension spans.
+extension spans, and banded heuristics.
 
 Singletrack does not support `AlignmentScope::Score`, lambda/custom matchers,
-edit/indel/gap-linear penalties, BiWFA, or banded heuristics. Unsupported
-builder configurations return `WfaError::IncompatibleMemoryModel`; unsupported
-lambda calls panic before entering WFA2.
+edit/indel/gap-linear penalties, or BiWFA. Unsupported builder configurations
+return `WfaError::IncompatibleMemoryModel`; unsupported lambda calls panic
+before entering WFA2.
+
+`MemoryModel::MemoryUltraLow` supports ends-free BiWFA when match rewards are
+zero. WFA2 still rejects ends-free BiWFA with nonzero free ends and negative
+match rewards (`match < 0`); the Rust wrapper panics before entering WFA2 for
+that combination.
 
 ### CIGAR orientation and SAM
 

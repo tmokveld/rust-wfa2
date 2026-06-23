@@ -841,10 +841,52 @@ fn test_align_ends_free_lambda_matches_byte_alignment_outputs() {
 }
 
 #[test]
-fn test_align_ends_free_lambda_rejects_ultralow_nonzero_free_ends() {
+fn test_align_ends_free_lambda_ultralow_nonzero_free_ends_matches_high_memory() {
+    let pattern = b"AAAACCCCGGGG";
+    let text = b"TTTTAAAACCCCGGGGTTTT";
+    let text_begin_free = 4;
+    let text_end_free = 4;
+
+    let mut high = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
+        .affine(1, 2, 1)
+        .build()
+        .unwrap();
+    let high_result = high.align_ends_free_lambda(
+        pattern.len(),
+        0,
+        0,
+        text.len(),
+        text_begin_free,
+        text_end_free,
+        |pattern_pos, text_pos| pattern[pattern_pos] == text[text_pos],
+    );
+    assert_eq!(high_result.status, AlignmentStatus::StatusAlgCompleted);
+
+    let mut ultralow = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryUltraLow)
+        .affine(1, 2, 1)
+        .build()
+        .unwrap();
+    let ultralow_result = ultralow.align_ends_free_lambda(
+        pattern.len(),
+        0,
+        0,
+        text.len(),
+        text_begin_free,
+        text_end_free,
+        |pattern_pos, text_pos| pattern[pattern_pos] == text[text_pos],
+    );
+
+    assert_eq!(ultralow_result.status, high_result.status);
+    assert_eq!(ultralow.score(), high.score());
+    assert_eq!(ultralow.get_alignment_span(), high.get_alignment_span());
+    assert_eq!(ultralow.get_alignment(), high.get_alignment());
+}
+
+#[test]
+fn test_align_ends_free_lambda_rejects_ultralow_negative_match_rewards() {
     let matcher_calls = AtomicU64::new(0);
     let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryUltraLow)
-        .edit()
+        .affine_with_match(-1, 1, 2, 1)
         .build()
         .unwrap();
 
@@ -855,14 +897,16 @@ fn test_align_ends_free_lambda_rejects_ultralow_nonzero_free_ends() {
         });
     }));
 
-    let payload = result.expect_err("expected MemoryUltraLow ends-free lambda rejection");
+    let payload = result.expect_err("expected MemoryUltraLow negative-match ends-free rejection");
     let message = payload
         .downcast_ref::<&str>()
         .copied()
         .or_else(|| payload.downcast_ref::<String>().map(String::as_str));
     assert_eq!(
         message,
-        Some("Ends-free alignment is not supported with MemoryUltraLow")
+        Some(
+            "Ends-free alignment with negative match rewards is not supported with MemoryUltraLow"
+        )
     );
     assert_eq!(matcher_calls.load(Ordering::Relaxed), 0);
 }
@@ -947,10 +991,56 @@ fn test_align_ends_free_packed2bits_matches_byte_alignment_outputs() {
 }
 
 #[test]
-fn test_align_ends_free_packed2bits_rejects_ultralow_nonzero_free_ends() {
+fn test_align_ends_free_packed2bits_ultralow_nonzero_free_ends_matches_high_memory() {
+    let pattern = b"AAAACCCCGGGG";
+    let text = b"TTTTAAAACCCCGGGGTTTT";
+    let packed_pattern = pack_dna_2bits(pattern);
+    let packed_text = pack_dna_2bits(text);
+    let text_begin_free = 4;
+    let text_end_free = 4;
+
+    let mut high = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
+        .affine(1, 2, 1)
+        .build()
+        .unwrap();
+    let high_result = high.align_ends_free_packed2bits(
+        &packed_pattern,
+        pattern.len(),
+        0,
+        0,
+        &packed_text,
+        text.len(),
+        text_begin_free,
+        text_end_free,
+    );
+    assert_eq!(high_result.status, AlignmentStatus::StatusAlgCompleted);
+
+    let mut ultralow = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryUltraLow)
+        .affine(1, 2, 1)
+        .build()
+        .unwrap();
+    let ultralow_result = ultralow.align_ends_free_packed2bits(
+        &packed_pattern,
+        pattern.len(),
+        0,
+        0,
+        &packed_text,
+        text.len(),
+        text_begin_free,
+        text_end_free,
+    );
+
+    assert_eq!(ultralow_result.status, high_result.status);
+    assert_eq!(ultralow.score(), high.score());
+    assert_eq!(ultralow.get_alignment_span(), high.get_alignment_span());
+    assert_eq!(ultralow.get_alignment(), high.get_alignment());
+}
+
+#[test]
+fn test_align_ends_free_packed2bits_rejects_ultralow_negative_match_rewards() {
     let packed = pack_dna_2bits(b"ACGT");
     let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryUltraLow)
-        .edit()
+        .affine_with_match(-1, 1, 2, 1)
         .build()
         .unwrap();
 
@@ -958,10 +1048,12 @@ fn test_align_ends_free_packed2bits_rejects_ultralow_nonzero_free_ends() {
         aligner.align_ends_free_packed2bits(&packed, 4, 0, 1, &packed, 4, 0, 0);
     }));
 
-    let payload = result.expect_err("expected MemoryUltraLow ends-free packed rejection");
+    let payload = result.expect_err("expected MemoryUltraLow negative-match packed rejection");
     assert_eq!(
         panic_message(payload.as_ref()),
-        Some("Ends-free alignment is not supported with MemoryUltraLow")
+        Some(
+            "Ends-free alignment with negative match rewards is not supported with MemoryUltraLow"
+        )
     );
 }
 
@@ -1378,10 +1470,58 @@ fn test_aligner_extension_rejects_ultralow_memory() {
 }
 
 #[test]
-#[should_panic(expected = "Ends-free alignment is not supported with MemoryUltraLow")]
-fn test_aligner_ends_free_rejects_ultralow_memory() {
+fn test_aligner_ends_free_ultralow_nonzero_free_ends_matches_high_memory() {
+    let pattern = b"AAAACCCCGGGG";
+    let text = b"TTTTAAAACCCCGGGGTTTT";
+
+    let mut high = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
+        .affine(1, 2, 1)
+        .build()
+        .unwrap();
+    let high_result = high.align_ends_free(pattern, 0, 0, text, 4, 4);
+    assert_eq!(high_result.status, AlignmentStatus::StatusAlgCompleted);
+
+    let mut ultralow = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryUltraLow)
+        .affine(1, 2, 1)
+        .build()
+        .unwrap();
+    let ultralow_result = ultralow.align_ends_free(pattern, 0, 0, text, 4, 4);
+
+    assert_eq!(ultralow_result.status, high_result.status);
+    assert_eq!(ultralow.score(), high.score());
+    assert_eq!(ultralow.get_alignment_span(), high.get_alignment_span());
+    assert_eq!(ultralow.get_alignment(), high.get_alignment());
+}
+
+#[test]
+fn test_aligner_ends_free_ultralow_score_scope_matches_high_memory() {
+    let (pattern, mut text) = divergent_sequences(300);
+    text.extend_from_slice(b"TTTTTTTT");
+
+    let mut high = WFAligner::builder(AlignmentScope::Score, MemoryModel::MemoryHigh)
+        .affine(4, 6, 2)
+        .build()
+        .unwrap();
+    let high_result = high.align_ends_free(&pattern, 0, 0, &text, 0, 8);
+    assert_eq!(high_result.status, AlignmentStatus::StatusAlgCompleted);
+
+    let mut ultralow = WFAligner::builder(AlignmentScope::Score, MemoryModel::MemoryUltraLow)
+        .affine(4, 6, 2)
+        .build()
+        .unwrap();
+    let ultralow_result = ultralow.align_ends_free(&pattern, 0, 0, &text, 0, 8);
+
+    assert_eq!(ultralow_result.status, high_result.status);
+    assert_eq!(ultralow.score(), high.score());
+}
+
+#[test]
+#[should_panic(
+    expected = "Ends-free alignment with negative match rewards is not supported with MemoryUltraLow"
+)]
+fn test_aligner_ends_free_rejects_ultralow_negative_match_rewards() {
     let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryUltraLow)
-        .affine(6, 4, 2)
+        .affine_with_match(-1, 1, 2, 1)
         .build()
         .unwrap();
 
@@ -1666,12 +1806,14 @@ fn test_singletrack_packed2bits_matches_high_memory() {
 }
 
 #[test]
-fn test_singletrack_allows_non_banded_heuristics() {
+fn test_singletrack_allows_heuristics() {
     for heuristics in [
         Heuristics::wf_adaptive(1, 10, 50),
         Heuristics::wf_mash(1, 10, 50),
         Heuristics::xdrop(1, 10),
         Heuristics::zdrop(1, 10),
+        Heuristics::banded_static(-50, 50),
+        Heuristics::banded_adaptive(1, -50, 50),
     ] {
         let mut aligner =
             WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemorySingletrack)
@@ -1684,6 +1826,34 @@ fn test_singletrack_allows_non_banded_heuristics() {
             result.status,
             AlignmentStatus::StatusAlgCompleted | AlignmentStatus::StatusAlgPartial
         ));
+    }
+}
+
+#[test]
+fn test_singletrack_banded_heuristics_match_high_memory() {
+    for heuristics in [
+        Heuristics::banded_static(-50, 50),
+        Heuristics::banded_adaptive(1, -50, 50),
+    ] {
+        let mut high = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
+            .affine(6, 4, 2)
+            .with_heuristics(heuristics)
+            .build()
+            .unwrap();
+        let high_result = high.align_end_to_end(PATTERN, TEXT);
+        assert_eq!(high_result.status, AlignmentStatus::StatusAlgCompleted);
+
+        let mut singletrack =
+            WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemorySingletrack)
+                .affine(6, 4, 2)
+                .with_heuristics(heuristics)
+                .build()
+                .unwrap();
+        let singletrack_result = singletrack.align_end_to_end(PATTERN, TEXT);
+
+        assert_eq!(singletrack_result.status, high_result.status);
+        assert_eq!(singletrack_result.score, high_result.score);
+        assert_alignment_surfaces_match(&mut high, &mut singletrack);
     }
 }
 
@@ -1707,14 +1877,6 @@ fn test_singletrack_rejects_unsupported_builder_configs() {
         WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemorySingletrack)
             .linear(6, 2)
             .build(),
-        WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemorySingletrack)
-            .affine(6, 4, 2)
-            .with_heuristics(Heuristics::banded_static(-10, 10))
-            .build(),
-        WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemorySingletrack)
-            .affine(6, 4, 2)
-            .with_heuristics(Heuristics::banded_adaptive(1, -10, 10))
-            .build(),
     ] {
         assert!(matches!(
             result,
@@ -1724,21 +1886,28 @@ fn test_singletrack_rejects_unsupported_builder_configs() {
 }
 
 #[test]
-fn test_singletrack_set_heuristics_rejects_banded() {
-    let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemorySingletrack)
+fn test_singletrack_set_heuristics_allows_banded() {
+    let heuristics = Heuristics::banded_static(-50, 50);
+    let mut high = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
         .affine(6, 4, 2)
         .build()
         .unwrap();
+    high.set_heuristics(heuristics);
+    let high_result = high.align_end_to_end(PATTERN, TEXT);
+    assert_eq!(high_result.status, AlignmentStatus::StatusAlgCompleted);
 
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        aligner.set_heuristics(Heuristics::banded_static(-10, 10));
-    }));
+    let mut singletrack =
+        WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemorySingletrack)
+            .affine(6, 4, 2)
+            .build()
+            .unwrap();
+    singletrack.set_heuristics(heuristics);
+    let singletrack_result = singletrack.align_end_to_end(PATTERN, TEXT);
 
-    let payload = result.expect_err("expected MemorySingletrack banded heuristic rejection");
-    assert_eq!(
-        panic_message(payload.as_ref()),
-        Some("MemorySingletrack is incompatible with this aligner: singletrack does not support banded heuristics")
-    );
+    assert_eq!(singletrack.get_heuristics(), heuristics);
+    assert_eq!(singletrack_result.status, high_result.status);
+    assert_eq!(singletrack_result.score, high_result.score);
+    assert_alignment_surfaces_match(&mut high, &mut singletrack);
 }
 
 #[test]
