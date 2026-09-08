@@ -687,7 +687,7 @@ impl WfaRawHandle {
         unsafe { (*inner).alignment_form.extension }
     }
 
-    pub(crate) fn wfa_packed_cigar(&self, show_mismatches: bool) -> Vec<u32> {
+    pub(crate) fn sam_packed_cigar(&self, show_mismatches: bool) -> Vec<u32> {
         if self.inner.is_null() {
             panic!("Internal aligner pointer is null");
         }

@@ -16,6 +16,30 @@ fn raw_cigar_string(aligner: &WFAligner) -> String {
     String::from_utf8(aligner.wfa_cigar_bytes()).unwrap()
 }
 
+fn assert_cigar_is_valid(aligner: &WFAligner, pattern: &[u8], text: &[u8], text_end_free: usize) {
+    let (mut pattern_pos, mut text_pos) = (0, 0);
+    for operation in aligner.wfa_cigar_bytes() {
+        match operation {
+            b'M' | b'X' => {
+                assert!(pattern_pos < pattern.len() && text_pos < text.len());
+                assert_eq!(
+                    pattern[pattern_pos] == text[text_pos],
+                    operation == b'M',
+                    "invalid operation at ({pattern_pos}, {text_pos})"
+                );
+                pattern_pos += 1;
+                text_pos += 1;
+            }
+            b'I' => text_pos += 1,
+            b'D' => pattern_pos += 1,
+            _ => panic!("unexpected WFA operation: {operation}"),
+        }
+        assert!(pattern_pos <= pattern.len() && text_pos <= text.len());
+    }
+    assert_eq!(pattern_pos, pattern.len());
+    assert!((text.len() - text_end_free..=text.len()).contains(&text_pos));
+}
+
 fn panic_message<'a>(payload: &'a (dyn Any + Send + 'static)) -> Option<&'a str> {
     payload
         .downcast_ref::<&str>()
@@ -1516,6 +1540,215 @@ fn test_aligner_ends_free_ultralow_score_scope_matches_high_memory() {
 }
 
 #[test]
+fn test_ends_free_then_global_reuse_matches_fresh_aligner() {
+    // Upstream's short edit case and divergent BiWFA case exercise both the
+    // top-level reset and recursive/base aligner initialization.
+    for (memory, len, expected_score) in [
+        (MemoryModel::MemoryHigh, 5, 5),
+        (MemoryModel::MemoryUltraLow, 512, -2048),
+    ] {
+        let pattern = vec![b'A'; len];
+        let text = vec![b'T'; len];
+        for scope in [AlignmentScope::Alignment, AlignmentScope::Score] {
+            let build = || {
+                let builder = WFAligner::builder(scope, memory);
+                if memory == MemoryModel::MemoryHigh {
+                    builder.edit().build().unwrap()
+                } else {
+                    builder.affine(4, 6, 2).build().unwrap()
+                }
+            };
+            let mut fresh = build();
+            let fresh_result = fresh.align_end_to_end(&pattern, &text);
+            assert_eq!(fresh_result.status, AlignmentStatus::StatusAlgCompleted);
+            assert_eq!(fresh.score(), expected_score);
+            if scope == AlignmentScope::Alignment {
+                assert_cigar_is_valid(&fresh, &pattern, &text, 0);
+            }
+
+            for free_pattern in [false, true] {
+                let mut reused = build();
+                let initial = if free_pattern {
+                    reused.align_ends_free(b"AAAATGGGG", 4, 4, b"T", 0, 0)
+                } else {
+                    reused.align_ends_free(b"T", 0, 0, b"AAAATGGGG", 4, 4)
+                };
+                assert_eq!(initial.status, AlignmentStatus::StatusAlgCompleted);
+                assert_eq!(reused.score(), 0);
+
+                let result = reused.align_end_to_end(&pattern, &text);
+                assert_eq!(
+                    result.status,
+                    AlignmentStatus::StatusAlgCompleted,
+                    "{memory:?}, {scope:?}, free_pattern={free_pattern}"
+                );
+                assert_eq!(reused.score(), fresh.score());
+                if scope == AlignmentScope::Alignment {
+                    assert_cigar_is_valid(&reused, &pattern, &text, 0);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn test_ultralow_asymmetric_static_band_matches_same_band_high_memory() {
+    // Exact deterministic shifted/divergent fixture from
+    // WFA2-lib/tests/wfa_banded_biwfa_regression.c.
+    let mut state = 42_u32;
+    let pattern: Vec<u8> = (0..256)
+        .map(|_| {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            b"ACGT"[(state >> 30) as usize]
+        })
+        .collect();
+    let mut text = vec![b'T'; 16];
+    text.extend_from_slice(&pattern[..240]);
+    for i in (24..240).step_by(7) {
+        text[i] = if text[i] == b'A' { b'C' } else { b'A' };
+    }
+    let mut ends_free_text = text.clone();
+    ends_free_text.extend_from_slice(&[b'G'; 16]);
+
+    for (pattern, text, min_k, max_k, text_end_free) in [
+        (pattern.as_slice(), text.as_slice(), -4, 20, 0),
+        (text.as_slice(), pattern.as_slice(), -20, 4, 0),
+        (pattern.as_slice(), ends_free_text.as_slice(), -4, 20, 16),
+    ] {
+        let mut high = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
+            .affine2p(5, 8, 2, 24, 1)
+            .with_heuristics(Heuristics::banded_static(min_k, max_k))
+            .build()
+            .unwrap();
+        let reference = if text_end_free == 0 {
+            high.align_end_to_end(pattern, text)
+        } else {
+            high.align_ends_free(pattern, 0, 0, text, 0, text_end_free)
+        };
+        assert_eq!(reference.status, AlignmentStatus::StatusAlgCompleted);
+        assert_cigar_is_valid(&high, pattern, text, text_end_free as usize);
+
+        for scope in [AlignmentScope::Alignment, AlignmentScope::Score] {
+            let mut ultralow = WFAligner::builder(scope, MemoryModel::MemoryUltraLow)
+                .affine2p(5, 8, 2, 24, 1)
+                .with_heuristics(Heuristics::banded_static(min_k, max_k))
+                .build()
+                .unwrap();
+            let result = if text_end_free == 0 {
+                ultralow.align_end_to_end(pattern, text)
+            } else {
+                ultralow.align_ends_free(pattern, 0, 0, text, 0, text_end_free)
+            };
+            assert_eq!(
+                result.status,
+                AlignmentStatus::StatusAlgCompleted,
+                "band=[{min_k},{max_k}], {scope:?}, text_end_free={text_end_free}"
+            );
+            assert_eq!(ultralow.score(), high.score());
+            if scope == AlignmentScope::Alignment {
+                assert_cigar_is_valid(&ultralow, pattern, text, text_end_free as usize);
+            }
+            if scope == AlignmentScope::Alignment && text_end_free == 0 {
+                let mut diagonal = 0;
+                for operation in ultralow.wfa_cigar_bytes() {
+                    match operation {
+                        b'I' => diagonal += 1,
+                        b'D' => diagonal -= 1,
+                        _ => {}
+                    }
+                    assert!((min_k..=max_k).contains(&diagonal));
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn test_exhausted_edit_and_indel_static_band_statuses() {
+    let pattern = [b'A'; 128];
+    let text = [b'C'; 256];
+    for indel in [false, true] {
+        for (memory, expected_status) in [
+            (MemoryModel::MemoryHigh, AlignmentStatus::StatusAlgPartial),
+            (
+                MemoryModel::MemoryUltraLow,
+                AlignmentStatus::StatusUnattainable,
+            ),
+        ] {
+            for scope in [AlignmentScope::Alignment, AlignmentScope::Score] {
+                let builder = WFAligner::builder(scope, memory)
+                    .with_max_alignment_steps(1024)
+                    .with_heuristics(Heuristics::banded_static(-4, 4));
+                let mut aligner = if indel {
+                    builder.indel().build().unwrap()
+                } else {
+                    builder.edit().build().unwrap()
+                };
+                for (pattern, text) in [
+                    (pattern.as_slice(), text.as_slice()),
+                    (text.as_slice(), pattern.as_slice()),
+                ] {
+                    let result = aligner.align_end_to_end(pattern, text);
+                    assert_eq!(
+                        result.status,
+                        expected_status,
+                        "indel={indel}, {memory:?}, {scope:?}, lengths=({}, {})",
+                        pattern.len(),
+                        text.len()
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn test_ultralow_full_i32_static_band_with_recursive_shifts() {
+    let mut pattern = vec![b'A'; 512];
+    pattern.extend_from_slice(&[b'C'; 512]);
+    let mut text = vec![b'G'; 128];
+    text.extend_from_slice(&pattern[..896]);
+
+    for (pattern, text) in [
+        (pattern.as_slice(), text.as_slice()),
+        (text.as_slice(), pattern.as_slice()),
+    ] {
+        for scope in [AlignmentScope::Alignment, AlignmentScope::Score] {
+            let mut aligner = WFAligner::builder(scope, MemoryModel::MemoryUltraLow)
+                .affine(4, 6, 2)
+                .with_heuristics(Heuristics::banded_static(i32::MIN, i32::MAX))
+                .build()
+                .unwrap();
+            let result = aligner.align_end_to_end(pattern, text);
+            assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
+            // Two 128-base gaps: -(6 + 2*128) * 2.
+            assert_eq!(aligner.score(), -524);
+            if scope == AlignmentScope::Alignment {
+                assert_cigar_is_valid(&aligner, pattern, text, 0);
+            }
+        }
+    }
+}
+
+#[test]
+fn test_adaptive_band_moves_beyond_initial_bounds() {
+    let pattern = b"ACGT".repeat(32);
+    let mut text = vec![b'T'; 20];
+    text.extend_from_slice(&pattern);
+    for memory in [MemoryModel::MemoryHigh, MemoryModel::MemorySingletrack] {
+        let mut aligner = WFAligner::builder(AlignmentScope::Alignment, memory)
+            .affine(4, 6, 2)
+            .with_heuristics(Heuristics::banded_adaptive(1, -4, 4))
+            .build()
+            .unwrap();
+        let result = aligner.align_end_to_end(&pattern, &text);
+        assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
+        // Full consumption requires the movable band to reach diagonal +20.
+        assert_cigar_is_valid(&aligner, &pattern, &text, 0);
+    }
+}
+
+#[test]
 #[should_panic(
     expected = "Ends-free alignment with negative match rewards is not supported with MemoryUltraLow"
 )]
@@ -2333,19 +2566,50 @@ fn test_wfa_and_sam_cigars_have_explicit_indel_orientation() {
         .build()
         .unwrap();
 
-    let result = aligner.align_end_to_end(query, reference);
-    assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
-    assert_eq!(aligner.wfa_cigar_bytes(), b"MMMMD");
-    assert_eq!(aligner.sam_cigar_bytes(), b"MMMMI");
-    assert_eq!(aligner.wfa_packed_cigar(false), vec![64, 18]);
-    assert_eq!(aligner.sam_packed_cigar(false), vec![64, 17]);
-    assert_eq!(aligner.wfa_cigar(false), vec![(4, 'M'), (1, 'D')]);
-    assert_eq!(aligner.sam_cigar(false), vec![(4, 'M'), (1, 'I')]);
+    for (pattern, text, wfa_bytes, sam_bytes, wfa_indel, sam_indel) in [
+        (
+            query.as_slice(),
+            reference.as_slice(),
+            b"MMMMD",
+            b"MMMMI",
+            'D',
+            'I',
+        ),
+        (
+            reference.as_slice(),
+            query.as_slice(),
+            b"MMMMI",
+            b"MMMMD",
+            'I',
+            'D',
+        ),
+    ] {
+        let result = aligner.align_end_to_end(pattern, text);
+        assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
+        assert_eq!(aligner.wfa_cigar_bytes(), wfa_bytes);
+        assert_eq!(aligner.sam_cigar_bytes(), sam_bytes);
 
-    let result = aligner.align_end_to_end(reference, query);
-    assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
-    assert_eq!(aligner.wfa_cigar_bytes(), b"MMMMI");
-    assert_eq!(aligner.wfa_packed_cigar(false), vec![64, 17]);
+        // Revisit both mismatch modes and alternate APIs: WFA conversion must not
+        // mutate the native SAM cache, including when it is regenerated.
+        for show_mismatches in [false, true, false] {
+            let (wfa_packed, sam_packed) = match (wfa_indel, show_mismatches) {
+                ('D', false) => ([64, 18], [64, 17]),
+                ('D', true) => ([71, 18], [71, 17]),
+                ('I', false) => ([64, 17], [64, 18]),
+                ('I', true) => ([71, 17], [71, 18]),
+                _ => unreachable!(),
+            };
+            let match_op = if show_mismatches { '=' } else { 'M' };
+            let wfa_decoded = [(4, match_op), (1, wfa_indel)];
+            let sam_decoded = [(4, match_op), (1, sam_indel)];
+            assert_eq!(aligner.wfa_packed_cigar(show_mismatches), wfa_packed);
+            assert_eq!(aligner.sam_packed_cigar(show_mismatches), sam_packed);
+            assert_eq!(aligner.wfa_cigar(show_mismatches), wfa_decoded);
+            assert_eq!(aligner.sam_cigar(show_mismatches), sam_decoded);
+            assert_eq!(aligner.wfa_cigar_bytes(), wfa_bytes);
+            assert_eq!(aligner.sam_cigar_bytes(), sam_bytes);
+        }
+    }
 }
 
 #[test]

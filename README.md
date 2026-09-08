@@ -3,8 +3,6 @@
 Rust language bindings for the excellent
 [WFA2-Lib](https://github.com/smarco/WFA2-lib) library.
 
-Work in progress. Tests and features are not yet complete.
-
 ## Native codegen (SIMD)
 
 The WFA2 C library is always compiled in an optimized (`-O3`,

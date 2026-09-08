@@ -78,3 +78,7 @@ jobs:
 
       - name: Test workspace (${{ matrix.name }})
         run: cargo test --workspace --all-targets --locked ${{ matrix.features }} --verbose
+
+      - name: Test ignored WFA2 reference suite
+        if: matrix.name == 'default'
+        run: cargo test --locked --test wfa2_reference -- --ignored

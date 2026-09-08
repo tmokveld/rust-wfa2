@@ -100,10 +100,22 @@ pub enum DropHeuristic {
     ZDrop { zdrop: i32 },
 }
 
+/// Restrict alignment to a static or movable band of WFA diagonals.
+///
+/// Diagonals use `k = text_pos - pattern_pos`, regardless of CIGAR orientation.
+/// A band can exclude the unbanded optimal path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum BandHeuristic {
+    /// Fixed inclusive bounds in the original input coordinates.
+    ///
+    /// Bounds support the full `i32` range. BiWFA translates them into recursive
+    /// sub-alignments and retains the same band during score-only endpoint recovery.
     Static { min_k: i32, max_k: i32 },
+    /// A movable band whose width is `max_k - min_k + 1`.
+    ///
+    /// The band can move beyond the initial bounds at heuristic cutoffs; these
+    /// are not fixed global limits.
     Adaptive { min_k: i32, max_k: i32 },
 }
 
@@ -189,10 +201,19 @@ impl Heuristics {
         Self::new(steps_between_cutoffs).with_drop(DropHeuristic::ZDrop { zdrop })
     }
 
+    /// Restrict alignment to inclusive global diagonals `min_k..=max_k`.
+    ///
+    /// Uses `k = text_pos - pattern_pos` and supports full-range `i32` bounds,
+    /// including recursive BiWFA and same-band score-only endpoint recovery.
+    /// The band can exclude the unbanded optimal path.
     pub fn banded_static(min_k: i32, max_k: i32) -> Self {
         Self::none().with_band(BandHeuristic::Static { min_k, max_k })
     }
 
+    /// Use a movable band of width `max_k - min_k + 1`.
+    ///
+    /// The band can move beyond the initial bounds every `steps_between_cutoffs`
+    /// steps; unlike static bounds, these are not fixed global limits.
     pub fn banded_adaptive(steps_between_cutoffs: i32, min_k: i32, max_k: i32) -> Self {
         Self::new(steps_between_cutoffs).with_band(BandHeuristic::Adaptive { min_k, max_k })
     }
@@ -474,10 +495,19 @@ impl From<u32> for DistanceMetric {
 pub enum AlignmentStatus {
     // OK Status (>=0)
     StatusAlgCompleted = wfa2::WF_STATUS_ALG_COMPLETED as isize,
+    /// Alignment stopped with a partial result, not a successful full alignment.
+    ///
+    /// Includes exhausted edit/indel frontiers in `MemoryHigh`. Native endpoint
+    /// coordinates may be absent, including in score-only scope.
     StatusAlgPartial = wfa2::WF_STATUS_ALG_PARTIAL as isize,
     // FAILED Status (<0)
     StatusMaxStepsReached = wfa2::WF_STATUS_MAX_STEPS_REACHED as isize,
     StatusOOM = wfa2::WF_STATUS_OOM as isize,
+    /// The requested alignment could not be reached.
+    ///
+    /// Includes band-pruned, exhausted edit/indel frontiers in BiWFA
+    /// (`MemoryUltraLow`), where `MemoryHigh` instead reports
+    /// [`AlignmentStatus::StatusAlgPartial`].
     StatusUnattainable = wfa2::WF_STATUS_UNATTAINABLE as isize,
 }
 

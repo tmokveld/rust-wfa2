@@ -349,21 +349,23 @@ impl WFAligner {
     /// The integer packing follows the BAM convention (`len << 4 | op_code`),
     /// but the operation stream keeps WFA2's native orientation: it describes
     /// how to transform the `pattern` argument into the `text` argument.
+    /// Converts WFA2's packed SAM output back to WFA orientation by swapping
+    /// packed `I` and `D` op codes in the returned Rust-owned buffer.
     pub fn wfa_packed_cigar(&self, show_mismatches: bool) -> Vec<u32> {
         self.ensure_alignment_scope("get WFA packed CIGAR");
-        self.raw.wfa_packed_cigar(show_mismatches)
+        let mut cigar = self.raw.sam_packed_cigar(show_mismatches);
+        swap_indel_ops_in_packed_cigar(&mut cigar);
+        cigar
     }
 
     /// Return a SAM-oriented CIGAR encoded in BAM/SAM's packed integer format.
     ///
     /// This method assumes the last alignment used `pattern` as query and `text`
-    /// as reference. It converts WFA's pattern-to-text orientation by swapping
-    /// packed `I` and `D` op codes.
+    /// as reference. WFA2's packed output already has this orientation, so no
+    /// additional indel conversion is performed.
     pub fn sam_packed_cigar(&self, show_mismatches: bool) -> Vec<u32> {
         self.ensure_alignment_scope("get SAM CIGAR");
-        let mut cigar = self.raw.wfa_packed_cigar(show_mismatches);
-        swap_indel_ops_in_packed_cigar(&mut cigar);
-        cigar
+        self.raw.sam_packed_cigar(show_mismatches)
     }
 
     /// Decode BAM/SAM packed CIGAR integers into `(length, op)` pairs without
