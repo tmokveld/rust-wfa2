@@ -33,7 +33,7 @@ fn main() {
         // SSE tuning is x86-only. Enabling it on aarch64 (e.g. Apple Silicon) fails the build.
         extra_flags.push_str(" -msse2 -mfpmath=sse");
     }
-    for flag in native_codegen_flags() {
+    if let Some(flag) = native_codegen_flags() {
         extra_flags.push(' ');
         extra_flags.push_str(flag);
     }
@@ -179,23 +179,23 @@ fn target_arch() -> String {
 /// takes precedence over `avx2`. `avx2` (`-mavx2`) only makes sense on x86_64, where it
 /// defines `__AVX2__` and activates WFA2's hand-written AVX2 kernel; on other targets it is
 /// ignored with a warning rather than failing the build.
-fn native_codegen_flags() -> Vec<&'static str> {
+fn native_codegen_flags() -> Option<&'static str> {
     let native = env::var_os("CARGO_FEATURE_NATIVE").is_some();
     let avx2 = env::var_os("CARGO_FEATURE_AVX2").is_some();
 
     if native {
-        return vec!["-march=native"];
+        return Some("-march=native");
     }
     if avx2 {
         if target_arch() == "x86_64" {
-            return vec!["-mavx2"];
+            return Some("-mavx2");
         }
         println!(
             "cargo:warning=wfa2-sys: the `avx2` feature only affects x86_64 targets; ignoring on {}",
             target_arch()
         );
     }
-    Vec::new()
+    None
 }
 
 fn prefixed_file(env_var: &str, package: &str, relative_path: &str) -> Option<PathBuf> {

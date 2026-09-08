@@ -201,14 +201,6 @@ impl WfaRawHandle {
         }
     }
 
-    /// Panic if a lambda/custom matcher was requested under `MemorySingletrack`,
-    /// which WFA2 rejects by exiting the process.
-    fn assert_lambda_supported(&self) {
-        if self.memory_model() == MemoryModel::MemorySingletrack {
-            panic!("Lambda/custom sequence inputs are not supported with MemorySingletrack");
-        }
-    }
-
     /// Return the underlying aligner pointer, panicking if it is null.
     fn checked_inner(&self) -> *mut wfa2::wavefront_aligner_t {
         if self.inner.is_null() {
@@ -367,10 +359,6 @@ impl WfaRawHandle {
         }
     }
 
-    pub(crate) fn plotting_enabled(&self) -> bool {
-        self.attributes.inner.plot.enabled
-    }
-
     pub(crate) fn align(&mut self, pattern: &[u8], text: &[u8]) -> AlignmentResult {
         self.last_sequence_lengths = Some((pattern.len(), text.len()));
         let raw_status = unsafe {
@@ -421,7 +409,10 @@ impl WfaRawHandle {
     where
         F: Fn(usize, usize) -> bool + Sync,
     {
-        self.assert_lambda_supported();
+        // WFA2 rejects lambda/custom matchers with MemorySingletrack by exiting the process.
+        if self.memory_model() == MemoryModel::MemorySingletrack {
+            panic!("Lambda/custom sequence inputs are not supported with MemorySingletrack");
+        }
         self.last_sequence_lengths = Some((pattern_len, text_len));
 
         let context = LambdaMatcherContext::new(matcher);
@@ -445,7 +436,7 @@ impl WfaRawHandle {
     }
 
     pub(crate) fn write_plot<P: AsRef<Path>>(&self, path: P) -> io::Result<()> {
-        if !self.plotting_enabled() {
+        if !self.attributes.inner.plot.enabled {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "WFA2 plotting was not enabled when the aligner was built",
@@ -664,11 +655,6 @@ impl WfaRawHandle {
         ))
     }
 
-    pub(crate) fn active_cigar_bytes(&self) -> Option<&[u8]> {
-        let cigar = self.cigar_view()?;
-        Some(cigar.active_operation_bytes())
-    }
-
     pub(crate) fn sequence_lengths(&self) -> (usize, usize) {
         // Use the lengths captured at `align` time. Reading them back from the C aligner is
         // unreliable for BiWFA (MemoryUltraLow): the top-level `sequences` is never populated
@@ -688,9 +674,7 @@ impl WfaRawHandle {
     }
 
     pub(crate) fn sam_packed_cigar(&self, show_mismatches: bool) -> Vec<u32> {
-        if self.inner.is_null() {
-            panic!("Internal aligner pointer is null");
-        }
+        self.checked_inner();
 
         unsafe {
             let mut sam_cigar_buffer_ptr: *mut u32 = std::ptr::null_mut();
@@ -714,9 +698,7 @@ impl WfaRawHandle {
     }
 
     pub(crate) fn count_matches(&self) -> i32 {
-        if self.inner.is_null() {
-            panic!("Internal aligner pointer is null");
-        }
+        self.checked_inner();
         let cigar_ptr = self.cigar_ptr();
         if cigar_ptr.is_null() {
             panic!("CIGAR pointer is null, cannot count matches.");

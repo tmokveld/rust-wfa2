@@ -326,11 +326,11 @@ impl WFAligner {
     pub fn wfa_cigar_bytes(&self) -> Vec<u8> {
         self.ensure_alignment_scope("get WFA CIGAR bytes");
 
-        let cigar_str = self
-            .raw
-            .active_cigar_bytes()
-            .expect("CIGAR is null, alignment might have failed or scope was Score");
-        cigar_str.to_vec()
+        self.raw
+            .cigar_view()
+            .expect("CIGAR is null, alignment might have failed or scope was Score")
+            .active_operation_bytes()
+            .to_vec()
     }
 
     /// Return raw CIGAR operation bytes in SAM reference-to-query orientation.
