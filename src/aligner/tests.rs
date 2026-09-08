@@ -2876,7 +2876,7 @@ fn test_get_alignment_biwfa_global_long_recursion() {
     // (MIN_LENGTH = 100, MIN_SCORE = 250), forcing multiple recursive splits. Each split
     // rewrites the C aligner's `wf_forward` sequence bounds, so the reported sequence
     // lengths must come from the values captured at `align` time, not the C struct.
-    let bases = [b'A', b'C', b'G', b'T'];
+    let bases = *b"ACGT";
     let mut pattern = Vec::new();
     let mut text = Vec::new();
     let mut state: u64 = 0x9E3779B97F4A7C15;
@@ -3277,7 +3277,7 @@ fn test_alignment_status_display_strings() {
 fn divergent_sequences(len: usize) -> (Vec<u8>, Vec<u8>) {
     // Two independent pseudo-random sequences. Being unrelated, they force a high score and
     // therefore a large MemoryHigh wavefront footprint.
-    let bases = [b'A', b'C', b'G', b'T'];
+    let bases = *b"ACGT";
     let mut pattern = Vec::with_capacity(len);
     let mut text = Vec::with_capacity(len);
     let mut state: u64 = 0x1234_5678_9ABC_DEF0;
