@@ -1,19 +1,5 @@
-use std::collections::HashSet;
 use std::env;
 use std::path::{Path, PathBuf};
-
-#[derive(Debug)]
-struct IgnoreMacros(HashSet<String>);
-
-impl bindgen::callbacks::ParseCallbacks for IgnoreMacros {
-    fn will_parse_macro(&self, name: &str) -> bindgen::callbacks::MacroParsingBehavior {
-        if self.0.contains(name) {
-            bindgen::callbacks::MacroParsingBehavior::Ignore
-        } else {
-            bindgen::callbacks::MacroParsingBehavior::Default
-        }
-    }
-}
 
 fn main() {
     let openmp_enabled = env::var_os("CARGO_FEATURE_OPENMP").is_some();
@@ -52,24 +38,15 @@ fn main() {
         emit_openmp_linking();
     }
 
-    let ignored_macros = IgnoreMacros(
-        vec![
-            "FP_INFINITE".into(),
-            "FP_NAN".into(),
-            "FP_NORMAL".into(),
-            "FP_SUBNORMAL".into(),
-            "FP_ZERO".into(),
-            "IPPORT_RESERVED".into(),
-        ]
-        .into_iter()
-        .collect(),
-    );
-
     bindgen::Builder::default()
         .header("WFA2-lib/utils/commons.h")
         .header("WFA2-lib/wavefront/wfa.h")
+        // Keep libc runtime declarations out of the bindings; dependent system types
+        // are still included by bindgen's recursive allowlisting.
+        .allowlist_file(r".*WFA2-lib[/\\].*")
+        // Plot output uses C streams and must share bindgen's FILE type.
+        .allowlist_function("fopen|fclose")
         .clang_arg("--include-directory=WFA2-lib")
-        .parse_callbacks(Box::new(ignored_macros))
         .generate()
         .expect("Unable to generate bindings")
         .write_to_file(out_dir.join("bindings.rs"))
