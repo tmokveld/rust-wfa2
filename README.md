@@ -3,6 +3,10 @@
 Rust language bindings for the excellent
 [WFA2-Lib](https://github.com/smarco/WFA2-lib) library.
 
+The raw `rust_wfa2::wfa2` bindings expose declarations from WFA2's headers and
+their required system types. Unrelated libc functions are not exported, except
+for `fopen` and `fclose`, which the plot writer uses with WFA2's C streams.
+
 ## Native codegen (SIMD)
 
 The WFA2 C library is always compiled in an optimized (`-O3`,
