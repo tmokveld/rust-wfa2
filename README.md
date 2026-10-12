@@ -3,6 +3,9 @@
 Rust language bindings for the excellent
 [WFA2-Lib](https://github.com/smarco/WFA2-lib) library.
 
+The bundled submodule uses [tmokveld/WFA2-lib](https://github.com/tmokveld/WFA2-lib),
+pinned to [4340e38](https://github.com/tmokveld/WFA2-lib/commit/4340e38f1c38e3808f28a507df68139a76175b80).
+
 The raw `rust_wfa2::wfa2` bindings expose declarations from WFA2's headers and
 their required system types. Unrelated libc functions are not exported, except
 for `fopen` and `fclose`, which the plot writer uses with WFA2's C streams.
