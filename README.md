@@ -4,7 +4,7 @@ Rust language bindings for the excellent
 [WFA2-Lib](https://github.com/smarco/WFA2-lib) library.
 
 The bundled submodule uses [tmokveld/WFA2-lib](https://github.com/tmokveld/WFA2-lib),
-pinned to [7766590](https://github.com/tmokveld/WFA2-lib/commit/776659000362d25ef0214465bce3621c0d0d2761).
+pinned to [14dcd90](https://github.com/tmokveld/WFA2-lib/commit/14dcd907f5cc8ec8ddeb738a2c4302ad25cc996f).
 
 The raw `rust_wfa2::wfa2` bindings expose declarations from WFA2's headers and
 their required system types. Unrelated libc functions are not exported, except
