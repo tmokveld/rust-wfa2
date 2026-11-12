@@ -42,6 +42,23 @@ impl WfaOp {
     }
 }
 
+/// Yields maximal runs of identical consecutive operations as `(op, run_length)`.
+///
+/// Borrows any operation slice without allocating, including operations
+/// concatenated from multiple alignments. Empty input yields no runs.
+pub fn op_runs(ops: &[WfaOp]) -> impl Iterator<Item = (WfaOp, usize)> + '_ {
+    let mut remaining = ops;
+    std::iter::from_fn(move || {
+        let (&op, tail) = remaining.split_first()?;
+        let len = 1 + tail
+            .iter()
+            .position(|&next| next != op)
+            .unwrap_or(tail.len());
+        remaining = &remaining[len..];
+        Some((op, len))
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct WfaAlign {

@@ -14,7 +14,7 @@ mod tests;
 pub use builder::WFAlignerBuilder;
 pub use cigar::CigarOp;
 pub use config::{
-    AdaptiveHeuristic, AlignmentResult, AlignmentScope, AlignmentStatus, BandHeuristic,
+    op_runs, AdaptiveHeuristic, AlignmentResult, AlignmentScope, AlignmentStatus, BandHeuristic,
     DistanceMetric, DropHeuristic, Heuristics, MemoryModel, Penalties, PlotOptions, ResourceLimits,
     WfaAlign, WfaError, WfaOp,
 };

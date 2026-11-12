@@ -16,6 +16,80 @@ fn raw_cigar_string(aligner: &WFAligner) -> String {
     String::from_utf8(aligner.wfa_cigar_bytes()).unwrap()
 }
 
+#[test]
+fn test_op_runs_empty() {
+    assert_eq!(op_runs(&[]).collect::<Vec<_>>(), vec![]);
+}
+
+#[test]
+fn test_op_runs_single() {
+    assert_eq!(op_runs(&[Match]).collect::<Vec<_>>(), vec![(Match, 1)]);
+}
+
+#[test]
+fn test_op_runs_mixed() {
+    let ops = [Match, Match, Subst, Ins, Ins, Ins, Del, Match];
+    assert_eq!(
+        op_runs(&ops).collect::<Vec<_>>(),
+        vec![(Match, 2), (Subst, 1), (Ins, 3), (Del, 1), (Match, 1)]
+    );
+}
+
+#[test]
+fn test_op_runs_concatenated_alignments_merge_at_join() {
+    let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
+        .edit()
+        .build()
+        .unwrap();
+    let result = aligner.align_end_to_end(b"ACGT", b"ATGT");
+    assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
+    let mut ops = aligner.get_alignment().operations;
+    assert_eq!(ops, vec![Match, Subst, Match, Match]);
+
+    let result = aligner.align_end_to_end(b"GCTA", b"GCAA");
+    assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
+    let second_ops = aligner.get_alignment().operations;
+    assert_eq!(second_ops, vec![Match, Match, Subst, Match]);
+    ops.extend(second_ops);
+
+    let runs = op_runs(&ops).collect::<Vec<_>>();
+    assert_eq!(
+        runs,
+        vec![(Match, 1), (Subst, 1), (Match, 4), (Subst, 1), (Match, 1)]
+    );
+    let expanded = runs
+        .into_iter()
+        .flat_map(|(op, len)| (0..len).map(move |_| op))
+        .collect::<Vec<_>>();
+    assert_eq!(expanded, ops);
+}
+
+#[test]
+fn test_op_runs_generated_sequences() {
+    // Enumerate every sequence of up to seven operations in base four.
+    let alphabet = [Match, Subst, Ins, Del];
+    for len in 0..=7 {
+        for mut code in 0..4_usize.pow(len) {
+            let ops = (0..len)
+                .map(|_| {
+                    let op = alphabet[code % 4];
+                    code /= 4;
+                    op
+                })
+                .collect::<Vec<_>>();
+            let runs = op_runs(&ops).collect::<Vec<_>>();
+            assert_eq!(runs.iter().map(|&(_, len)| len).sum::<usize>(), ops.len());
+            assert!(runs.iter().all(|&(_, len)| len > 0));
+            assert!(runs.windows(2).all(|pair| pair[0].0 != pair[1].0));
+            let expanded = runs
+                .into_iter()
+                .flat_map(|(op, len)| (0..len).map(move |_| op))
+                .collect::<Vec<_>>();
+            assert_eq!(expanded, ops);
+        }
+    }
+}
+
 fn assert_cigar_is_valid(aligner: &WFAligner, pattern: &[u8], text: &[u8], text_end_free: usize) {
     let (mut pattern_pos, mut text_pos) = (0, 0);
     for operation in aligner.wfa_cigar_bytes() {
