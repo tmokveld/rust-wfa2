@@ -1,10 +1,10 @@
 # Rust bindings for WFA2-Lib
 
 Rust language bindings for the excellent
-[WFA2-Lib](https://github.com/smarco/WFA2-lib) library.
+[WFA2-Lib](https://github.com/Marco-Sola-Lab/WFA2-lib) library.
 
 The bundled submodule uses [tmokveld/WFA2-lib](https://github.com/tmokveld/WFA2-lib),
-pinned to [14dcd90](https://github.com/tmokveld/WFA2-lib/commit/14dcd907f5cc8ec8ddeb738a2c4302ad25cc996f).
+pinned to [875dbd9](https://github.com/tmokveld/WFA2-lib/commit/875dbd9b0c988699291a6b9e3e6dd06d30dd0358).
 
 The raw `rust_wfa2::wfa2` bindings expose declarations from WFA2's headers and
 their required system types. Unrelated libc functions are not exported, except
@@ -94,16 +94,16 @@ assert_eq!(
 
 ### Memory models
 
-`MemoryModel::MemoryUltraLow` selects WFA2's BiWFA mode.
-`MemoryModel::MemorySingletrack` selects WFA2's singletrack backtrace mode for
-low-memory full alignments. Singletrack supports `affine` and `affine2p`
-penalties over byte-slice and packed 2-bit inputs, with end-to-end, ends-free,
-extension spans, and banded heuristics.
+`MemoryModel::MemoryHigh` now uses Singletrack automatically for full `affine`
+and `affine2p` alignments. It retains the match wavefronts for traceback and
+recycles the indel wavefronts. If several alignments have the same optimal
+score, the CIGAR can differ from earlier `MemoryHigh` results.
 
-Singletrack does not support `AlignmentScope::Score`, lambda/custom matchers,
-edit/indel/gap-linear penalties, or BiWFA. Unsupported builder configurations
-return `WfaError::IncompatibleMemoryModel`; unsupported lambda calls panic
-before entering WFA2.
+`MemoryModel::MemorySingletrack` explicitly selects that same traceback for
+end-to-end, ends-free, and extension alignment. Both modes accept byte slices,
+packed 2-bit sequences, and custom matchers. Unlike `MemoryHigh`, explicit
+`MemorySingletrack` rejects score-only scope and edit, indel, or gap-linear
+penalties at build time with `WfaError::IncompatibleMemoryModel`.
 
 `MemoryModel::MemoryUltraLow` supports ends-free BiWFA when match rewards are
 zero. WFA2 still rejects ends-free BiWFA with nonzero free ends and negative

@@ -4,7 +4,8 @@ use std::fmt;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum MemoryModel {
-    /// Store all wavefronts explicitly.
+    /// Uses Singletrack traceback for full gap-affine and dual gap-affine
+    /// alignments. Other distances and score-only alignment remain supported.
     MemoryHigh,
     /// Medium-memory piggyback mode.
     MemoryMed,
@@ -12,12 +13,10 @@ pub enum MemoryModel {
     MemoryLow,
     /// Bidirectional WFA mode.
     MemoryUltraLow,
-    /// Singletrack backtrace mode.
+    /// Explicitly select the same Singletrack traceback as [`Self::MemoryHigh`].
     ///
-    /// This mode supports full alignments with gap-affine or gap-affine-2p
-    /// penalties over byte or packed 2-bit inputs. It does not support
-    /// score-only alignment, lambda/custom matchers, edit/indel/gap-linear
-    /// penalties, or BiWFA.
+    /// Requires full alignment with gap-affine or dual gap-affine penalties.
+    /// Supports byte slices, packed 2-bit inputs, and custom matchers.
     MemorySingletrack,
 }
 
@@ -524,7 +523,8 @@ pub enum AlignmentStatus {
     ///
     /// Includes band-pruned, exhausted edit/indel frontiers in BiWFA
     /// (`MemoryUltraLow`), where `MemoryHigh` instead reports
-    /// [`AlignmentStatus::StatusAlgPartial`].
+    /// [`AlignmentStatus::StatusAlgPartial`]. Singletrack also reports this
+    /// status with an empty CIGAR if it cannot reconstruct a valid traceback.
     StatusUnattainable = wfa2::WF_STATUS_UNATTAINABLE as isize,
 }
 

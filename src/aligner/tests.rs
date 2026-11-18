@@ -2218,21 +2218,19 @@ fn test_singletrack_set_heuristics_allows_banded() {
 }
 
 #[test]
-fn test_singletrack_rejects_lambda_inputs_before_entering_c() {
+fn test_singletrack_traces_custom_matches() {
+    let pattern = b"AcGT";
+    let text = b"ACGA";
     let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemorySingletrack)
         .affine(6, 4, 2)
         .build()
         .unwrap();
-
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        aligner.align_end_to_end_lambda(4, 4, |_, _| true);
-    }));
-
-    let payload = result.expect_err("expected MemorySingletrack lambda rejection");
-    assert_eq!(
-        panic_message(payload.as_ref()),
-        Some("Lambda/custom sequence inputs are not supported with MemorySingletrack")
-    );
+    let result = aligner.align_end_to_end_lambda(pattern.len(), text.len(), |v, h| {
+        pattern[v].eq_ignore_ascii_case(&text[h])
+    });
+    assert_eq!(result.status, AlignmentStatus::StatusAlgCompleted);
+    assert_eq!(aligner.score(), -6);
+    assert_eq!(aligner.wfa_cigar_bytes(), b"MMMX");
 }
 
 #[test]

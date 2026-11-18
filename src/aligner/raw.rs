@@ -409,10 +409,6 @@ impl WfaRawHandle {
     where
         F: Fn(usize, usize) -> bool + Sync,
     {
-        // WFA2 rejects lambda/custom matchers with MemorySingletrack by exiting the process.
-        if self.memory_model() == MemoryModel::MemorySingletrack {
-            panic!("Lambda/custom sequence inputs are not supported with MemorySingletrack");
-        }
         self.last_sequence_lengths = Some((pattern_len, text_len));
 
         let context = LambdaMatcherContext::new(matcher);
