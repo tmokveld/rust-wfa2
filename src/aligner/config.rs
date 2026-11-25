@@ -824,8 +824,14 @@ pub(crate) fn validate_memory_model_compatibility(
     memory_model: MemoryModel,
     alignment_scope: AlignmentScope,
     penalties: Penalties,
-    _heuristics: &Heuristics,
+    heuristics: &Heuristics,
 ) -> Result<(), WfaError> {
+    if memory_model == MemoryModel::MemoryUltraLow && heuristics.drop_heuristic().is_some() {
+        return Err(WfaError::IncompatibleMemoryModel {
+            memory_model,
+            reason: "BiWFA does not support X-drop or Z-drop heuristics",
+        });
+    }
     if memory_model != MemoryModel::MemorySingletrack {
         return Ok(());
     }

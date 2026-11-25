@@ -4,7 +4,7 @@ Rust language bindings for the excellent
 [WFA2-Lib](https://github.com/Marco-Sola-Lab/WFA2-lib) library.
 
 The bundled submodule uses [tmokveld/WFA2-lib](https://github.com/tmokveld/WFA2-lib),
-pinned to [875dbd9](https://github.com/tmokveld/WFA2-lib/commit/875dbd9b0c988699291a6b9e3e6dd06d30dd0358).
+pinned to [24748ec](https://github.com/tmokveld/WFA2-lib/commit/24748eca999013d464e36e9e29e15596dafa8f3a).
 
 The raw `rust_wfa2::wfa2` bindings expose declarations from WFA2's headers and
 their required system types. Unrelated libc functions are not exported, except
@@ -109,6 +109,8 @@ penalties at build time with `WfaError::IncompatibleMemoryModel`.
 zero. WFA2 still rejects ends-free BiWFA with nonzero free ends and negative
 match rewards (`match < 0`); the Rust wrapper panics before entering WFA2 for
 that combination.
+BiWFA does not support X-drop or Z-drop. Requesting either with `MemoryUltraLow`
+returns an error from `build()` or panics in `set_heuristics()`.
 
 ### CIGAR orientation and SAM
 

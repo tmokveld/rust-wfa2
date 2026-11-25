@@ -2785,6 +2785,27 @@ fn test_drop_heuristics_reject_edit_and_indel() {
 }
 
 #[test]
+fn test_ultralow_rejects_drop_heuristics() {
+    for heuristics in [Heuristics::xdrop(1, 10), Heuristics::zdrop(1, 10)] {
+        let builder = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryUltraLow)
+            .affine(6, 4, 2);
+        assert!(matches!(
+            builder.with_heuristics(heuristics).build(),
+            Err(WfaError::IncompatibleMemoryModel {
+                memory_model: MemoryModel::MemoryUltraLow,
+                ..
+            })
+        ));
+
+        let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryUltraLow)
+            .affine(6, 4, 2)
+            .build()
+            .unwrap();
+        assert!(std::panic::catch_unwind(move || aligner.set_heuristics(heuristics)).is_err());
+    }
+}
+
+#[test]
 fn test_combined_heuristics_alignment_completes() {
     let mut aligner = WFAligner::builder(AlignmentScope::Alignment, MemoryModel::MemoryHigh)
         .affine(6, 4, 2)
